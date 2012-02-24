@@ -67,14 +67,21 @@ let get_localhost ~__context : API.ref_host  =
     let uuid = get_localhost_uuid () in
 	Db.Host.get_by_uuid ~__context ~uuid
 
-let make_rpc ~__context xml =
+let make_rpc ~__context xml : XMLRPC.xmlrpc =
     let subtask_of = Ref.string_of (Context.get_task_id __context) in
-	let open Xmlrpcclient in
+	let open Xmlrpc_client in
 	let http = xmlrpc ~subtask_of ~version:"1.1" "/" in
 	let transport =
 		if Pool_role.is_master ()
 		then Unix(Xapi_globs.unix_domain_socket)
 		else SSL(SSL.make ~use_stunnel_cache:true (), Pool_role.get_master_address(), !Xapi_globs.https_port) in
+	XML_protocol.rpc ~transport ~http xml
+
+(* This one uses rpc-light *)
+let make_remote_rpc remote_address xml =
+	let open Xmlrpc_client in
+	let transport = SSL(SSL.make (), remote_address, !Xapi_globs.https_port) in
+	let http = xmlrpc ~version:"1.0" "/" in
 	XML_protocol.rpc ~transport ~http xml
 
 (** Log into pool master using the client code, call a function
@@ -119,7 +126,7 @@ let call_api_functions ~__context f =
       then Client.Client.Session.logout rpc session_id)
 
 let call_emergency_mode_functions hostname f =
-	let open Xmlrpcclient in
+	let open Xmlrpc_client in
 	let transport = SSL(SSL.make (), hostname, !Xapi_globs.https_port) in
 	let http = xmlrpc ~version:"1.0" "/" in
 	let rpc = XML_protocol.rpc ~transport ~http in
@@ -370,8 +377,8 @@ let vif_of_devid ~__context ~vm devid =
 	domid might immediately change after the call returns. Caller beware! *)
 let domid_of_vm ~__context ~self =
   let uuid = Uuid.uuid_of_string (Db.VM.get_uuid ~__context ~self) in
-  let all = Xc.with_intf (fun xc -> Xc.domain_getinfolist xc 0) in
-  let uuid_to_domid = List.map (fun di -> Uuid.uuid_of_int_array di.Xc.handle, di.Xc.domid) all in
+  let all = Xenctrl.with_intf (fun xc -> Xenctrl.domain_getinfolist xc 0) in
+  let uuid_to_domid = List.map (fun di -> Uuid.uuid_of_int_array di.Xenctrl.handle, di.Xenctrl.domid) all in
   if List.mem_assoc uuid uuid_to_domid
   then List.assoc uuid uuid_to_domid
   else -1 (* for backwards compat with old behaviour *)
@@ -398,11 +405,6 @@ let get_my_pbds __context =
   let localhost = get_localhost __context in
   let localhost = Ref.string_of localhost in
     Db.PBD.get_records_where ~__context ~expr:(Eq(Field "host", Literal localhost))
-
-let get_my_pifs ~__context : ([`PIF] Ref.t * API.pIF_t) list =
-	let localhost = get_localhost __context in
-	let localhost = Ref.string_of localhost in
-	Db.PIF.get_records_where ~__context ~expr:(Eq (Field "host", Literal localhost))
 
 (* Return the PBD for specified SR on a specific host *)
 (* Just say an SR is shared if it has more than one PBD *)
@@ -432,8 +434,11 @@ let compare_int_lists : int list -> int list -> int =
 
 let version_string_of : __context:Context.t -> API.ref_host -> string =
 	fun ~__context host ->
-		List.assoc Xapi_globs._product_version
-			(Db.Host.get_software_version ~__context ~self:host)
+		try
+			List.assoc Xapi_globs._platform_version
+				(Db.Host.get_software_version ~__context ~self:host)
+		with Not_found ->
+			Xapi_globs.default_platform_version
 
 let version_of : __context:Context.t -> API.ref_host -> int list =
 	fun ~__context host ->
@@ -441,7 +446,7 @@ let version_of : __context:Context.t -> API.ref_host -> int list =
 		in List.map int_of_string (String.split '.' vs)
 
 (* Compares host versions, analogous to Pervasives.compare. *)
-let compare_host_product_versions : __context:Context.t -> API.ref_host -> API.ref_host -> int =
+let compare_host_platform_versions : __context:Context.t -> API.ref_host -> API.ref_host -> int =
 	fun ~__context host_a host_b ->
 		let version_of = version_of ~__context in
 		compare_int_lists (version_of host_a) (version_of host_b)
@@ -466,17 +471,17 @@ let host_has_highest_version_in_pool : __context:Context.t -> host:API.ref_host 
 		(compare_int_lists host_version max_version) >= 0
 
 let host_versions_not_decreasing ~__context ~host_from ~host_to =
-	compare_host_product_versions ~__context host_from host_to <= 0
+	compare_host_platform_versions ~__context host_from host_to <= 0
 
-let is_product_version_same_on_master ~__context ~host =
+let is_platform_version_same_on_master ~__context ~host =
 	if is_pool_master ~__context ~host then true else
 	let pool = get_pool ~__context in
 	let master = Db.Pool.get_master ~__context ~self:pool in
-	compare_host_product_versions ~__context master host = 0
+	compare_host_platform_versions ~__context master host = 0
 
-let assert_product_version_is_same_on_master ~__context ~host ~self =
-	if not (is_product_version_same_on_master ~__context ~host) then
-		raise (Api_errors.Server_error (Api_errors.vm_resume_incompatible_version,
+let assert_platform_version_is_same_on_master ~__context ~host ~self =
+	if not (is_platform_version_same_on_master ~__context ~host) then
+		raise (Api_errors.Server_error (Api_errors.vm_host_incompatible_version,
 			[Ref.string_of host; Ref.string_of self]))
 
 (** PR-1007 - block operations during rolling upgrade *)
@@ -649,7 +654,7 @@ let on_oem ~__context =
 
 exception File_doesnt_exist of string
 
-let find_partition_path = Xapi_globs.base_path ^ "/libexec/find-partition"
+let find_partition_path = Filename.concat Fhs.libexecdir "find-partition"
 
 let find_secondary_partition () =
 	try
@@ -778,6 +783,30 @@ let loadavg () =
     float_of_string (List.hd (split_colon all))
   with _ -> -1.
 
+let memusage () =
+	let memtotal, memfree, swaptotal, swapfree, buffers, cached =
+		ref None, ref None, ref None, ref None, ref None, ref None in
+	let find_field key s v =
+		if String.startswith key s then
+			let vs = List.hd (List.filter ((<>) "") (List.tl (String.split ' ' s))) in
+			v := Some (float_of_string vs) in
+	try
+		Unixext.file_lines_iter
+			(fun s ->
+				 find_field "MemTotal" s memtotal;
+				 find_field "MemFree" s memfree;
+				 find_field "SwapTotal" s swaptotal;
+				 find_field "SwapFree" s swapfree;
+				 find_field "Buffers" s buffers;
+				 find_field "Cached" s cached)
+			"/proc/meminfo";
+		match !memtotal, !memfree, !swaptotal, !swapfree, !buffers, !cached with
+		| Some mt, Some mf, Some st, Some sf, Some bu, Some ca ->
+			  let su = if st = 0. then 0. else (st -. sf) /. st in
+			  (mt -. mf -. (bu +. ca) *. (1. -. su)) /. mt
+		| _ -> raise Exit
+	with _ -> - 1.
+
 let local_storage_exists () =
   (try ignore(Unix.stat (Xapi_globs.xapi_blob_location)); true
     with _ -> false)
@@ -867,3 +896,9 @@ let short_string_of_ref x =
   let x' = Ref.string_of x in
   String.sub x' (String.length "OpaqueRef:") 8
 
+let force_loopback_vbd ~__context =
+	(* Workaround assumption in SMRT: if a global flag is set, force use
+	   of loopback VBDs. *)
+	let pool = get_pool ~__context in
+	let other_config = Db.Pool.get_other_config ~__context ~self:pool in
+	List.mem_assoc "force_loopback_vbd" other_config

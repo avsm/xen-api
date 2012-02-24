@@ -19,6 +19,7 @@ open Stringext
 open Printf
 open Xapi_vm_memory_constraints
 open Listext
+open Xenstore
 
 module D=Debug.Debugger(struct let name="xapi" end)
 open D
@@ -87,10 +88,18 @@ let validate_basic_parameters ~__context ~self ~snapshot:x =
 let set_actions_after_crash ~__context ~self ~value = 
 	Db.VM.set_actions_after_crash ~__context ~self ~value
 let set_is_a_template ~__context ~self ~value =
-	let appliance = Db.VM.get_appliance ~__context ~self in
-	if Db.is_valid_ref __context appliance then
-		raise (Api_errors.Server_error(Api_errors.vm_is_part_of_an_appliance,
-			[(Ref.string_of self); (Ref.string_of appliance)]));
+	if value then begin
+		(* Don't allow VMs in an appliance to be converted into templates. *)
+		let appliance = Db.VM.get_appliance ~__context ~self in
+		if Db.is_valid_ref __context appliance then
+			raise (Api_errors.Server_error(Api_errors.vm_is_part_of_an_appliance,
+				[(Ref.string_of self); (Ref.string_of appliance)]));
+		(* Don't allow VMPR-protected VMs to be converted into templates. *)
+		let protection_policy = Db.VM.get_protection_policy ~__context ~self in
+		if Db.is_valid_ref __context protection_policy then
+			raise (Api_errors.Server_error(Api_errors.vm_assigned_to_protection_policy,
+				[(Ref.string_of self); (Ref.string_of protection_policy)]))
+	end;
 	(* We define a 'set_is_a_template false' as 'install time' *)
 	info "VM.set_is_a_template('%b')" value;
 	let m = Db.VM.get_metrics ~__context ~self in
@@ -733,10 +742,6 @@ let set_memory_target_live ~__context ~self ~target = () (*
 	Vmopshelpers.with_xs (fun xs -> Balloon.set_memory_target ~xs domid target)
 *)
 
-(** The default upper bound on the length of time to wait *)
-(** for a running VM to reach its current memory target.  *)
-let wait_memory_target_timeout_seconds = 256
-
 (** The default upper bound on the acceptable difference between *)
 (** actual memory usage and target memory usage when waiting for *)
 (** a running VM to reach its current memory target.             *)
@@ -756,21 +761,21 @@ let is_power_of_2 n =
 (** if the time-out counter exceeds its limit, this function   *)
 (** raises a server error and terminates.                      *)
 let wait_memory_target_live ~__context ~self
-	?(timeout_seconds = wait_memory_target_timeout_seconds)
-	?(tolerance_bytes = wait_memory_target_tolerance_bytes)
-	() =
+		?(timeout_seconds = int_of_float !Xapi_globs.wait_memory_target_timeout)
+		?(tolerance_bytes = wait_memory_target_tolerance_bytes)
+		() =
 	let raise_error error =
 		raise (Api_errors.Server_error (error, [Ref.string_of (Context.get_task_id __context)])) in
 	let rec wait accumulated_wait_time_seconds =
-		if accumulated_wait_time_seconds > wait_memory_target_timeout_seconds
+		if accumulated_wait_time_seconds > timeout_seconds
 			then raise_error Api_errors.vm_memory_target_wait_timeout;
 		if TaskHelper.is_cancelling ~__context
 			then raise_error Api_errors.task_cancelled;
 		(* Fetch up-to-date value of memory_actual via a hypercall to Xen. *)
 		let domain_id = Helpers.domid_of_vm ~__context ~self in
-		let domain_info = Vmopshelpers.with_xc (fun xc -> Xc.domain_getinfo xc domain_id) in
-		let memory_actual_pages = Int64.of_nativeint domain_info.Xc.total_memory_pages in
-		let memory_actual_kib = Xc.pages_to_kib memory_actual_pages in 
+		let domain_info = Vmopshelpers.with_xc (fun xc -> Xenctrl.domain_getinfo xc domain_id) in
+		let memory_actual_pages = Int64.of_nativeint domain_info.Xenctrl.total_memory_pages in
+		let memory_actual_kib = Xenctrl.pages_to_kib memory_actual_pages in 
 		let memory_actual_bytes = Memory.bytes_of_kib memory_actual_kib in
 		(* Fetch up-to-date value of target from xenstore. *)
 		let memory_target_kib = Int64.of_string (Vmopshelpers.with_xs (fun xs -> xs.Xs.read (xs.Xs.getdomainpath domain_id ^ "/memory/target"))) in
@@ -812,52 +817,6 @@ let set_HVM_shadow_multiplier ~__context ~self ~value =
 	validate_HVM_shadow_multiplier value;
 	Db.VM.set_HVM_shadow_multiplier ~__context ~self ~value;
 	update_memory_overhead ~__context ~vm:self
-
-(** Sets the HVM shadow multiplier for a {b Running} VM. Runs on the slave. *)
-let set_shadow_multiplier_live ~__context ~self ~multiplier =
-	if Db.VM.get_power_state ~__context ~self <> `Running
-	then failwith "assertion_failed: set_shadow_multiplier_live should only be \
-		called when the VM is Running";
-	validate_HVM_shadow_multiplier multiplier;
-	if Helpers.has_booted_hvm ~__context ~self then (
-		let bootrec = Helpers.get_boot_record ~__context ~self in
-		let domid = Helpers.domid_of_vm ~__context ~self in
-		let vcpus = Int64.to_int bootrec.API.vM_VCPUs_max in
-		let static_max_mib = Memory.mib_of_bytes_used (bootrec.API.vM_memory_static_max) in
-		let newshadow = Int64.to_int (Memory.HVM.shadow_mib static_max_mib vcpus multiplier) in
-
-		(* Make sure enough free memory exists *)
-		let host = Db.VM.get_resident_on ~__context ~self in
-		let free_mem_b =
-			Memory_check.host_compute_free_memory_with_maximum_compression
-				~__context ~host None in
-		let free_mem_mib = Int64.to_int (Int64.div (Int64.div free_mem_b 1024L) 1024L) in
-		let multiplier_to_record = Xc.with_intf
-		  (fun xc ->
-		     let curshadow = Xc.shadow_allocation_get xc domid in
-		     let needed_mib = newshadow - curshadow in
-		     debug "Domid %d has %d MiB shadow; an increase of %d MiB requested; host has %d MiB free"
-		       domid curshadow needed_mib free_mem_mib;
-		     if free_mem_mib < needed_mib
-		     then raise (Api_errors.Server_error(Api_errors.host_not_enough_free_memory, [ Int64.to_string (Memory.bytes_of_mib (Int64.of_int needed_mib)); Int64.to_string free_mem_b ]));
-		     if not(Memory.wait_xen_free_mem xc (Int64.mul (Int64.of_int needed_mib) 1024L)) then begin
-		       warn "Failed waiting for Xen to free %d MiB: some memory is not properly accounted" needed_mib;
-		       (* Dump stats here: *)
-		       let (_ : int64) =
-		         Memory_check.host_compute_free_memory_with_maximum_compression
-		           ~dump_stats:true ~__context ~host None in
-		       raise (Api_errors.Server_error(Api_errors.host_not_enough_free_memory, [ Int64.to_string (Memory.bytes_of_mib (Int64.of_int needed_mib)); Int64.to_string free_mem_b ]));
-		     end;
-		     debug "Setting domid %d's shadow memory to %d MiB" domid newshadow;
-		     Xc.shadow_allocation_set xc domid newshadow;
-		     Memory.HVM.round_shadow_multiplier static_max_mib vcpus multiplier domid) in
-		Db.VM.set_HVM_shadow_multiplier ~__context ~self ~value:multiplier_to_record;
-		let newbootrec = { bootrec with API.vM_HVM_shadow_multiplier = multiplier_to_record } in
-		Helpers.set_boot_record ~__context ~self newbootrec;
-		update_memory_overhead ~__context ~vm:self;
-		()
-	) else
-		()
 
 let send_sysrq ~__context ~vm ~key =
   raise (Api_errors.Server_error (Api_errors.not_implemented, [ "send_sysrq" ]))
@@ -969,6 +928,15 @@ let copy_guest_metrics ~__context ~vm =
 	with _ ->
 		Ref.null
 
+let start_delay ~__context ~vm =
+	let start_delay = Db.VM.get_start_delay ~__context ~self:vm in
+	Thread.delay (Int64.to_float start_delay)
+
+let shutdown_delay ~__context ~vm =
+	let shutdown_delay = Db.VM.get_shutdown_delay ~__context ~self:vm in
+	Thread.delay (Int64.to_float shutdown_delay)
+
+
 (* Populate last_boot_CPU_flags with the vendor and feature set of the given host's CPU. *)
 let populate_cpu_flags ~__context ~vm ~host =
 	let add_or_replace (key, value) values =
@@ -1050,3 +1018,25 @@ let assert_can_be_recovered ~__context ~self ~session_to =
 		let sr = Db.SR.get_by_uuid ~__context ~uuid:sr_uuid in
 		raise (Api_errors.Server_error(Api_errors.vm_requires_sr,
 			[Ref.string_of self; Ref.string_of sr]))
+
+(* BIOS strings *)
+
+let copy_bios_strings ~__context ~vm ~host =
+	(* only allow to fill in BIOS strings if they are not yet set *)
+	let current_strings = Db.VM.get_bios_strings ~__context ~self:vm in
+	if List.length current_strings > 0 then
+		raise (Api_errors.Server_error(Api_errors.vm_bios_strings_already_set, []))
+	else begin
+		let bios_strings = Db.Host.get_bios_strings ~__context ~self:host in
+		Db.VM.set_bios_strings ~__context ~self:vm ~value:bios_strings;
+		(* also set the affinity field to push the VM to start on this host *)
+		Db.VM.set_affinity ~__context ~self:vm ~value:host
+	end
+
+let consider_generic_bios_strings ~__context ~vm =
+	(* check BIOS strings: set to generic values if empty *)
+	let bios_strings = Db.VM.get_bios_strings ~__context ~self:vm in
+	if bios_strings = [] then begin
+		info "The VM's BIOS strings were not yet filled in. The VM is now made BIOS-generic.";
+		Db.VM.set_bios_strings ~__context ~self:vm ~value:Xapi_globs.generic_bios_strings
+	end

@@ -1139,7 +1139,7 @@ let rec cmdtable_data : (string*cmd_spec) list =
    "vm-migrate",
     {
       reqd=[];
-      optn=["live"; "host"; "host-uuid"; "encrypt"; "force"];
+      optn=["live"; "host"; "host-uuid"; "remote-address"; "remote-username"; "remote-password"; "destination-sr-uuid"; "encrypt"; "force"];
       help="Migrate the selected VM(s). The parameter '--live' will migrate the VM without shutting it down. The 'host' parameter matches can be either the name or the uuid of the host. The parameter '--encrypt' will encrypt the memory image transfer.";
       implementation= No_fd Cli_operations.vm_migrate;
       flags=[Standard; Vm_selectors];
@@ -1276,7 +1276,7 @@ there are two or more empty CD devices, please use the command 'vbd-insert' and 
    "vm-export",
     {
       reqd=["filename"];
-      optn=["preserve-power-state"; "compress"];
+      optn=["preserve-power-state"; "compress"; "include-snapshots"];
       help="Export a VM to <filename>.";
       implementation= With_fd Cli_operations.vm_export;
       flags=[Standard; Vm_selectors];
@@ -1483,7 +1483,7 @@ there are two or more empty CD devices, please use the command 'vbd-insert' and 
    "bond-create",
     {
       reqd=["network-uuid"; "pif-uuids"];
-      optn=["mac"; "mode"];
+      optn=["mac"; "mode"; "properties:"];
       help="Create a bonded interface from a list of existing PIF objects.";
       implementation=No_fd Cli_operations.bond_create;
       flags=[];
@@ -1833,7 +1833,7 @@ add a mapping of 'path' -> '/tmp', the command line should contain the argument 
    "vif-unplug",
     {
       reqd=["uuid"];
-      optn=[];
+      optn=["force"];
       help="Attempt to detach the VIF while the VM is in the running state.";
       implementation=No_fd Cli_operations.vif_unplug;
       flags=[];
@@ -2037,6 +2037,14 @@ add a mapping of 'path' -> '/tmp', the command line should contain the argument 
       implementation=No_fd Cli_operations.diagnostic_db_stats;
       flags=[Neverforward];
     };
+   "diagnostic-net-stats",
+	{
+		reqd=[];
+		optn=["uri"; "method"; "params"];
+		help="Print network stats.";
+		implementation=No_fd Cli_operations.diagnostic_net_stats;
+		flags=[Neverforward];
+	};
    "diagnostic-db-log",
     {
       reqd=[];
@@ -2300,16 +2308,6 @@ add a mapping of 'path' -> '/tmp', the command line should contain the argument 
       help="Get the installed server SSL certificate.";
       implementation=No_fd Cli_operations.host_get_server_certificate;
       flags=[Host_selectors]
-    };
-
-    (* Half-way house before templates are fully removed from xapi *)
-    "regenerate-built-in-templates",
-    {
-      reqd=[];
-      optn=[];
-      help="Regenerate any missing built-in templates";
-      implementation=No_fd Cli_operations.regenerate_built_in_templates;
-      flags=[Hidden];
     };
 
 		"secret-create",

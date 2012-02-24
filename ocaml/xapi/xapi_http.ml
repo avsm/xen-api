@@ -30,7 +30,7 @@ let inet_rpc xml =
 	let http = 80 and https = !Xapi_globs.https_port in
 	(* Bypass SSL for localhost, this works even if the management interface
 	   is disabled. *)
-	let open Xmlrpcclient in
+	let open Xmlrpc_client in
 	let transport =
 		if Pool_role.is_master ()
 		then TCP(host, http)
@@ -221,6 +221,11 @@ let with_context ?(dummy=false) label (req: Request.t) (s: Unix.file_descr) f =
     raise e
 
 (* Other exceptions are dealt with by the Http_svr module's exception handler *)
+
+let server =
+	let server = Http_svr.Server.empty () in
+	Http_svr.Server.enable_fastpath server;
+	server
 	  
 let http_request = Http.Request.make ~user_agent:Xapi_globs.xapi_user_agent
 
@@ -235,7 +240,7 @@ let bind inetaddr =
 	let timeout = 30.0 in (* 30s *)
 	while !result = None && (Unix.gettimeofday () -. start < timeout) do
 		try
-			result := Some (Http_svr.bind ~listen_backlog:Xapi_globs.listen_backlog inetaddr);
+			result := Some (Http_svr.bind ~listen_backlog:Xapi_globs.listen_backlog inetaddr description);
 		with Unix.Unix_error(code, _, _) ->
 			debug "While binding %s: %s" description (Unix.error_message code);
 			Thread.delay 5.
@@ -253,18 +258,18 @@ let add_handler (name, handler) =
 
 	let h = match handler with
 	| Http_svr.BufIO callback ->
-		Http_svr.BufIO (fun req ic ->
+		Http_svr.BufIO (fun req ic context ->
 			(try 
 				if check_rbac 
 				then (* rbac checks *)
 			   (try
-					assert_credentials_ok name req ~fn:(fun () -> callback req ic)
+					assert_credentials_ok name req ~fn:(fun () -> callback req ic context)
 			    with e ->
 			      debug "Leaving RBAC-handler in xapi_http after: %s" (ExnHelper.string_of_exn e);
 			      raise e
 				 )
 				else (* no rbac checks *)
-					callback req ic
+					callback req ic context
 			with
 			| Api_errors.Server_error(name, params) as e ->
 				error "Unhandled Api_errors.Server_error(%s, [ %s ])" name (String.concat "; " params);
@@ -272,10 +277,10 @@ let add_handler (name, handler) =
 			)
 		)
 	| Http_svr.FdIO callback ->
-		Http_svr.FdIO (fun req ic ->
+		Http_svr.FdIO (fun req ic context ->
 			(try 
 				(if check_rbac then assert_credentials_ok name req); (* session and rbac checks *)
-				callback req ic
+				callback req ic context
 			with
 			| Api_errors.Server_error(name, params) as e ->
 				error "Unhandled Api_errors.Server_error(%s, [ %s ])" name (String.concat "; " params);
@@ -290,4 +295,6 @@ let add_handler (name, handler) =
 	| Datamodel.Put -> Http.Put
 	| Datamodel.Post -> Http.Post
 	| Datamodel.Connect -> Http.Connect
-      in Http_svr.add_handler ty uri h
+	| Datamodel.Options -> Http.Options
+      in Http_svr.Server.add_handler server ty uri h
+

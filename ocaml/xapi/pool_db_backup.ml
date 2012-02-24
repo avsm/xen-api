@@ -23,8 +23,6 @@ open Db_cache_types
 module D = Debug.Debugger(struct let name="pool_db_sync" end)
 open D
 
-let pool_db_sync_timer = 60.0 *. 5. (* CA-16878: 5 minutes, same as the local database flush *)
-
 let octet_stream = Http.Hdr.content_type ^": application/octet-stream"
 
 (* CA-18377: The smallest database that is compatible with the Miami database schema. *)
@@ -93,7 +91,7 @@ let prepare_database_for_restore ~old_context ~new_context =
 		let physical = List.filter (fun self -> Db.PIF.get_physical ~__context:old_context ~self) all_pifs in
 		List.map (fun self -> Db.PIF.get_device ~__context:old_context ~self, self) physical in
   
-	(* Since it's difficult for us to change the /etc/xensource-inventory and the ifcfg-
+	(* Since it's difficult for us to change the @INVENTORY@ and the ifcfg-
        files, we /preserve/ the current management PIF across the restore. NB this interface
        might be a bond or a vlan. *)
 	let mgmt_dev = 
@@ -163,7 +161,7 @@ let restore_from_xml __context dry_run (xml_filename: string) =
 	then Db_xml.To.file Xapi_globs.db_temporary_restore_path (Db_ref.get_database (Context.database_of new_context))
   
 (** Called when a CLI user downloads a backup of the database *)
-let pull_database_backup_handler (req: Http.Request.t) s =
+let pull_database_backup_handler (req: Http.Request.t) s _ =
   debug "received request to write out db as xml";
   req.Http.Request.close <- true;
   Xapi_http.with_context "Dumping database as XML" req s
@@ -176,7 +174,7 @@ let pull_database_backup_handler (req: Http.Request.t) s =
     )
 
 (** Invoked only by the explicit database restore code *)
-let push_database_restore_handler (req: Http.Request.t) s =
+let push_database_restore_handler (req: Http.Request.t) s _ =
   debug "received request to restore db from xml dump";
   Xapi_http.with_context "Reading database as XML" req s
     (fun __context ->
@@ -203,15 +201,15 @@ let push_database_restore_handler (req: Http.Request.t) s =
 	
 	(* now restart *)
 	debug "xapi has received new database via xml; will reboot and use that db...";
-	info "Rebooting to use restored database after delay of: %d" Xapi_globs.db_restore_fuse_time;
-	Xapi_fuse.light_fuse_and_reboot ~fuse_length:Xapi_globs.db_restore_fuse_time ();
+	info "Rebooting to use restored database after delay of: %f" !Xapi_globs.db_restore_fuse_time;
+	Xapi_fuse.light_fuse_and_reboot ~fuse_length:!Xapi_globs.db_restore_fuse_time ();
       end
     ) 
 
 let http_fetch_db ~master_address ~pool_secret =
 	let request = Xapi_http.http_request ~cookie:[ "pool_secret", pool_secret ]
 		Http.Get Constants.pool_xml_db_sync in
-	let open Xmlrpcclient in
+	let open Xmlrpc_client in
 	let transport = SSL(SSL.make (), master_address, !Xapi_globs.https_port) in
 	with_transport transport
 		(with_http request
@@ -263,7 +261,7 @@ let pool_db_backup_thread () =
 	let generation = Db_lock.with_lock (fun () -> Manifest.generation (Database.manifest (Db_ref.get_database (Context.database_of __context)))) in
 	let dohost host =
 	  try
-	    Thread.delay pool_db_sync_timer;
+	    Thread.delay !Xapi_globs.pool_db_sync_interval;
 	    debug "Starting DB synchronise with host %s" (Ref.string_of host);
 	    Helpers.call_api_functions ~__context
 	      (fun rpc session_id -> Client.Host.request_backup rpc session_id host generation false);
@@ -274,7 +272,7 @@ let pool_db_backup_thread () =
 	      log_backtrace () in
 
 	(* since thread.delay is inside dohost fn make sure we don't spin if hosts=[]: *)
-	if hosts=[] then Thread.delay pool_db_sync_timer
+	if hosts=[] then Thread.delay !Xapi_globs.pool_db_sync_interval
 	else List.iter dohost hosts;
       end
     with e -> debug "Exception in DB synchronise thread: %s" (ExnHelper.string_of_exn e)

@@ -62,10 +62,10 @@ let _ =
   let s, _ = Unix.accept sock in
 
   let rpc xml = 
-	  let open Xmlrpcclient in
+	  let open Xmlrpc_client in
 	  let http = xmlrpc ~version:"1.0" "/" in
 	  match !server with
-		  | "" -> XML_protocol.rpc ~transport:(Unix "/var/xapi/xapi") ~http xml
+		  | "" -> XML_protocol.rpc ~transport:(Unix (Filename.concat Fhs.vardir "xapi")) ~http xml
 		  | host -> XML_protocol.rpc ~transport:(SSL(SSL.make ~use_fork_exec_helper:false (), host, 443)) ~http xml in
 
   let find_vm rpc session_id vm = 
@@ -81,7 +81,7 @@ let _ =
        let resident_on = Client.VM.get_resident_on rpc session_id vm in
        let address = Client.Host.get_address rpc session_id resident_on in
 
-	   let open Xmlrpcclient in
+	   let open Xmlrpc_client in
 	   let http = connect
 		   ~session_id:(Ref.string_of session_id)
 		   (Printf.sprintf "%s?ref=%s" Constants.console_uri (Ref.string_of vm)) in

@@ -31,6 +31,7 @@ let vm_operation_table =
     `assert_operation_valid, "assertoperationvalid";
     `changing_dynamic_range, "changing_dynamic_range";
     `changing_static_range, "changing_static_range";
+    `changing_shadow_memory, "changing_shadow_memory";
     `clean_reboot, "clean_reboot";
     `clean_shutdown, "clean_shutdown";
     `clone, "clone";
@@ -133,6 +134,7 @@ let vif_operation_to_string = function
   | `attach -> "attach"
   | `plug -> "plug"
   | `unplug -> "unplug"
+  | `unplug_force -> "unplug_force"
 
 let vm_appliance_operation_to_string = function
   | `start -> "start"
@@ -308,6 +310,17 @@ let power_to_string h =
     | `ShuttingDown -> "shutting down"
     | `Migrating -> "migrating"
 
+let string_to_vdi_type x = match (String.lowercase x) with
+  | "system" -> Some `system
+  | "user" -> Some `user
+  | "ephemeral" -> Some `ephemeral
+  | "suspend" -> Some `suspend
+  | "crashdump" -> Some `crashdump
+  | "ha statefile" -> Some `ha_statefile
+  | "metadata" -> Some `metadata
+  | "redo log" -> Some `redo_log
+  | _ -> None
+
 let vdi_type_to_string t =
   match t with
   | `system -> "System"
@@ -334,11 +347,13 @@ let ip_configuration_mode_of_string m =
 let bond_mode_to_string = function
 	| `balanceslb -> "balance-slb"
 	| `activebackup -> "active-backup"
+	| `lacp -> "lacp"
 
 let bond_mode_of_string m =
 	match String.lowercase m with
 	| "balance-slb" | "" -> `balanceslb
 	| "active-backup" -> `activebackup
+	| "lacp" -> `lacp
 	| s -> raise (Record_failure ("Invalid bond mode. Got " ^ s))
 
 let bool_of_string s =

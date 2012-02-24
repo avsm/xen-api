@@ -23,7 +23,7 @@ open Smint
 module D=Debug.Debugger(struct let name="sm_exec" end)
 open D
 
-let sm_daemon_dir = "/var/xapi/sm"
+let sm_daemon_dir = Filename.concat Fhs.vardir "sm"
 
 let cmd_name driver = sprintf "%s/%sSR" Xapi_globs.sm_dir driver
 let daemon_path driver = sprintf "%s/%s" sm_daemon_dir driver
@@ -175,13 +175,13 @@ let exec_xmlrpc ?context ?(needs_session=true) (ty : sm_type) (driver: string) (
     let (xml,stderr) = Stats.time_this name (fun () -> 
       match ty with 
 	| Daemon ->
-		let open Xmlrpcclient in
+		let open Xmlrpc_client in
 		let http = xmlrpc ~version:"1.0" (Printf.sprintf "/%s" driver) in
 		let transport = Unix (daemon_path driver) in
 		XML_protocol.rpc ~transport ~http xml, ""
 	| Executable ->
 		let exe = cmd_name driver in
-		begin try			
+		begin try
 			let output, stderr = Forkhelpers.execute_command_get_output exe [ Xml.to_string xml ] in
 			begin try
 				(Xml.parse_string output), stderr

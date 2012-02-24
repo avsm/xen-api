@@ -1,6 +1,6 @@
 #!/bin/sh
 
-function usage()
+function usage
 {
   echo
   echo Usage:
@@ -20,18 +20,18 @@ if [ -z "$(xe vdi-list params=uuid uuid=${VDI})" ]; then
 fi
 
 COMMAND=$2
-if [ -z "$COMMAND" ]; then
-  COMMAND=/bin/sh
-elif ! which "$COMMAND" > /dev/null ; then
-  echo Failed to find command: ${COMMAND}
-  usage
-  exit 1
-else
-  shift 1
-  COMMAND=$*
+if [ -n "$COMMAND" ]; then
+  if ! which "$COMMAND" > /dev/null ; then
+    echo Failed to find command: ${COMMAND}
+    usage
+    exit 1
+  else
+    shift 1
+    COMMAND=$*
+  fi
 fi
 
-. /etc/xensource-inventory
+. @INVENTORY@
 
 if [ `xe vdi-param-get uuid=${VDI} param-name=read-only` = "true" ] ; then 
     MODE=RO
@@ -42,7 +42,10 @@ VBD=`xe vbd-create vm-uuid=${CONTROL_DOMAIN_UUID} vdi-uuid=${VDI} device=autodet
 xe vbd-plug uuid=${VBD}
 DEVICE=`xe vbd-param-get uuid=${VBD} param-name=device`
 export DEVICE
-echo DEVICE=${DEVICE}
+if [ -z "$COMMAND" ]; then
+  echo DEVICE=${DEVICE}
+  COMMAND=/bin/sh
+fi
 ${COMMAND}
 RC=$?
 xe vbd-unplug uuid=${VBD} timeout=15

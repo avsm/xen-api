@@ -1,4 +1,4 @@
-OCAMLPACKS    += threads xc xs
+OCAMLPACKS    += threads xenctrl xenstore
 OCAMLFLAGS    += -thread
 
 OCamlProgram(xstest, xstest common)
@@ -7,4 +7,4 @@ OCamlProgram(xscheckperms, perms common)
 
 .PHONY: clean
 clean:
-	rm -rf $(CLEAN_OBJS) *.aux *.log *.fig xapi
+	rm -rf $(CLEAN_OBJS) *.aux *.log *.fig xapi xstest xsbench xscheckperms

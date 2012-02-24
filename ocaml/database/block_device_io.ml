@@ -327,10 +327,14 @@ let transfer_data_from_sock_to_fd sock dest_fd available_space target_response_t
       ) ~block_size:16384 data_client
     )
     (fun () -> 
-      (* Close the connection *)
-      (* CA-42914: If there was an exception, note that we are forcibly closing the connection when possibly the client (xapi) is still trying to write data. This will cause it to see a 'connection reset by peer' error. *)
-      R.info "Closing connection on data socket";
-      ignore_exn (fun () -> Unix.close data_client)
+       (* Close the connection *)
+       (* CA-42914: If there was an exception, note that we are forcibly closing the connection when possibly the client (xapi) is still trying to write data. This will cause it to see a 'connection reset by peer' error. *)
+       R.info "Closing connection on data socket";
+       try
+         Unix.shutdown data_client Unix.SHUTDOWN_ALL;
+         Unix.close data_client
+       with e ->
+         R.warn "Exception %s while closing socket" (Printexc.to_string e);
     ) in
   R.debug "Finished reading from data socket";
   bytes_read
@@ -618,7 +622,7 @@ let action_read block_dev_fd client datasock target_response_time =
 
     (* Attempt to read a database record *)
     let length, db_fn, generation_count, marker = read_database block_dev_fd target_response_time in
-    
+
     (* Send the generation count and length of the database to the client *)
     send_response client (Printf.sprintf "%s|%016d|%016d" db_mesg generation_count length);
 
@@ -687,7 +691,7 @@ let _ =
 
   if !dump then begin
     (* Open the block device *)
-    let block_dev_fd = open_block_device !block_dev (Unix.gettimeofday() +. Xapi_globs.redo_log_max_startup_time) in
+    let block_dev_fd = open_block_device !block_dev (Unix.gettimeofday() +. !Xapi_globs.redo_log_max_startup_time) in
     R.info "Opened block device.";
 
     let target_response_time = Unix.gettimeofday() +. 3600. in
@@ -741,7 +745,7 @@ let _ =
 
   if !empty then begin
     (* Open the block device *)
-    let block_dev_fd = open_block_device !block_dev (Unix.gettimeofday() +. Xapi_globs.redo_log_max_startup_time) in
+    let block_dev_fd = open_block_device !block_dev (Unix.gettimeofday() +. !Xapi_globs.redo_log_max_startup_time) in
     R.info "Opened block device.";
 
     let target_response_time = Unix.gettimeofday() +. 3600. in
@@ -758,7 +762,7 @@ let _ =
     (* Main loop: accept a new client, communicate with it until it stops sending commands, repeat. *)
     while true do
       let start_of_startup = Unix.gettimeofday() in
-      let target_startup_response_time = start_of_startup +. Xapi_globs.redo_log_max_startup_time in
+      let target_startup_response_time = start_of_startup +. !Xapi_globs.redo_log_max_startup_time in
 
       R.debug "Awaiting incoming connections on %s..." !ctrlsock;
       let client = accept_conn s target_startup_response_time in
@@ -784,10 +788,10 @@ let _ =
                 
                 (* Note: none of the action functions throw any exceptions; they report errors directly to the client. *)
                 let (action_fn, block_time) = match str with
-                  | "writedelta" -> action_writedelta, Xapi_globs.redo_log_max_block_time_writedelta
-                  | "writedb___" -> action_writedb,    Xapi_globs.redo_log_max_block_time_writedb
-                  | "read______" -> action_read,       Xapi_globs.redo_log_max_block_time_read
-                  | "empty_____" -> action_empty,      Xapi_globs.redo_log_max_block_time_empty
+                  | "writedelta" -> action_writedelta, !Xapi_globs.redo_log_max_block_time_writedelta
+                  | "writedb___" -> action_writedb,    !Xapi_globs.redo_log_max_block_time_writedb
+                  | "read______" -> action_read,       !Xapi_globs.redo_log_max_block_time_read
+                  | "empty_____" -> action_empty,      !Xapi_globs.redo_log_max_block_time_empty
                   | _ -> (fun _ _ _ _ -> send_failure client (str^"|nack") ("Unknown command "^str)), 0.
                 in
                 (* "Start the clock!" -- set the latest time by which we need to have responded to the client. *)

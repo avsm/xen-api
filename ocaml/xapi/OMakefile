@@ -1,25 +1,27 @@
-OCAMLPACKS    = xml-light2 cdrom pciutil sexpr log stunnel http-svr rss xen-utils netdev tapctl vhd xs rpc-light
-OCAML_LIBS    = ../util/version ../util/vm_memory_constraints ../util/sanitycheck ../util/stats \
+OCAMLPACKS    = xml-light2 cdrom pciutil sexpr log stunnel http-svr rss xen-utils netdev tapctl vhd xenstore rpc-light
+OCAML_LIBS    = ../fhs ../util/version ../util/vm_memory_constraints ../util/sanitycheck ../util/stats \
 	../idl/ocaml_backend/common ../idl/ocaml_backend/client ../idl/ocaml_backend/server ../util/ocamltest
 OCAMLINCLUDES = ../idl ../idl/ocaml_backend \
 	../autogen ../database/ \
 	../xenops ../xva ../util \
-	../auth ../license ../client_records ../rfb ../gpg
+	../auth ../license ../client_records ../rfb ../gpg ../network ..
 
 UseCamlp4(rpc-light.syntax, features rrd monitor_fake monitor_fake_common vdi_automaton storage_impl xapi_udhcpd)
 UseCamlp4(rpc-light.idl, storage_interface)
 
 CFLAGS += -std=gnu99 -Wall -Werror -I$(shell ocamlc -where)
 
+#XENLIGHT_LINK_FLAGS= -cclib -lxlutil -cclib -luuid -cclib -lblktapctl -cclib -lutil -cclib -lxenlight -cclib -lxenstore
+XENLIGHT_LINK_FLAGS=-cclib -luuid
 # Since the section didn't work, link against the xen libs for everything if we are building
 # xen stuff at all.
 # NB order of libraries is important: OMake cannot determine dependencies between libraries
 # (the same holds for OCaml packages)
 XEN_OCAML_LIBS = ../xenops/xenops ../auth/pam
 XEN_OCAMLINCLUDES =
-XEN_OCAMLPACKS = xc xs cpuid
+XEN_OCAMLPACKS = xenctrl xenctrlext xenstore cpuid xenlight
 OCAML_CLIBS = $(XEN_OCAML_CLIBS) $(OCAML_CLIBS)
-OCAML_LINK_FLAGS = $(XEN_OCAML_LINK_FLAGS) $(OCAML_LINK_FLAGS)
+OCAML_LINK_FLAGS = $(XEN_OCAML_LINK_FLAGS) $(OCAML_LINK_FLAGS) $(XENLIGHT_LINK_FLAGS)
 CFLAGS = $(XEN_CFLAGS) $(CFLAGS)
 OCAMLINCLUDES = $(XEN_OCAMLINCLUDES) $(OCAMLINCLUDES)
 # xc.cma depends on uuid.cma
@@ -45,25 +47,26 @@ OCamlProgram(storage_impl_test, storage_interface vdi_automaton storage_impl sto
 COMMON = \
 	xapi_templates \
 	../idl/api_lowlevel \
+	../network/network_interface \
+	../network/network \
 	nm \
 	xapi_mgmt_iface \
 	smint \
 	../gpg/gpg \
 	helpers \
 	at_least_once_more \
-	create_templates \
 	fileserver
 
 #OCamlProgram(upload_receive, $(COMMON) fileupload upload_receive)
 
 OCamlProgram(quicktestbin, quicktest quicktest_common quicktest_ocamltest quicktest_storage quicktest_http quicktest_encodings quicktest_vm_placement vm_placement ../xenops/squeeze_test quicktest_vm_memory_constraints ../util/vm_memory_constraints quicktest_lifecycle)
-OCamlProgram(fakeguestagent, fakeguestagent)
 
 OCamlProgram(xenstore_copy, xenstore_dump xenstore_copy)
 
 OCamlProgram(rrddump, rrddump rrd)
 
 XAPI_MODULES = $(COMMON) \
+	system_domains \
 	local_work_queue \
 	../xva/xva \
 	../idl/ocaml_backend/json \
@@ -71,8 +74,11 @@ XAPI_MODULES = $(COMMON) \
 	../rfb/rfb_randomtest \
 	../client_records/records \
 	../client_records/record_util \
-	bootloader \
 	storage_access \
+	storage_mux \
+	storage_migrate \
+	storage_proxy \
+	xapi_services \
 	sm_exec \
 	sm \
 	storage_interface \
@@ -118,6 +124,7 @@ XAPI_MODULES = $(COMMON) \
 	../auth/parse_likewise \
 	xapi_subject \
 	audit_log \
+	xapi_xenops \
 	xapi_vmpp \
 	xapi_vm_appliance \
 	xapi_vm_appliance_lifecycle \
@@ -149,7 +156,6 @@ XAPI_MODULES = $(COMMON) \
 	sparse_dd_wrapper \
 	vmopshelpers \
 	vm_config \
-	vmops \
 	pciops \
 	vgpuops \
 	memory_control \
@@ -201,7 +207,6 @@ XAPI_MODULES = $(COMMON) \
 	dbsync_master \
 	sync_networking \
 	storage_access \
-	events \
 	import_xva \
 	import \
 	import_raw_vdi \
@@ -274,32 +279,20 @@ OCamlProgram(at_least_once_more, at_least_once_more at_least_once_more_test)
 
 .DEFAULT: xapi
 
-.PHONY: generate_constants
-
-generate_constants: config_constants.ml
-
-config_constants.ml: config_constants.ml.in
-	sed "s!@BASE_PATH@!\"$(RAW_BASE_PATH)\"!" $< > $@
-
 .PHONY: install
 install:
-	mkdir -p $(BIN_PATH)
-	cp -f xapi $(BIN_PATH)
-	mkdir -p $(DEBUGDIST)
-	$(IPROG) quicktest $(DEBUGDIST)
-	cp -f quicktestbin $(DEBUGDIST)
-	$(IPROG) rrddump $(DEBUGDIST)
-	mkdir -p $(LIBEXEC)
-	$(IPROG) sparse_dd $(LIBEXEC)
-	mkdir -p $(DESTDIR)/etc/xapi.d/plugins
-	$(IPROG) monitor_fake_plugin $(DESTDIR)/etc/xapi.d/plugins
-
-.PHONY: sdk-install
-sdk-install: install
-	mkdir -p $(LIBEXEC)
-	cp fakeguestagent $(LIBEXEC)/
+	mkdir -p $(DESTDIR)$(SBINDIR)
+	cp -f xapi $(DESTDIR)$(SBINDIR)
+	mkdir -p $(DESTDIR)$(OPTDIR)/debug
+	$(IPROG) quicktest $(DESTDIR)$(OPTDIR)/debug
+	cp -f quicktestbin $(DESTDIR)$(OPTDIR)/debug
+	$(IPROG) rrddump $(DESTDIR)$(OPTDIR)/debug
+	mkdir -p $(DESTDIR)$(LIBEXECDIR)
+	$(IPROG) sparse_dd $(DESTDIR)$(LIBEXECDIR)
+	mkdir -p $(DESTDIR)$(PLUGINDIR)
+	$(IPROG) monitor_fake_plugin $(DESTDIR)$(PLUGINDIR)
 
 .PHONY: clean
 clean:
 	rm -rf $(CLEAN_OBJS) *.aux *.log *.fig xapi
-	rm -f config_constants.ml
+	rm -f binpack xapi_unit_test sparse_dd monitor_fake_plugin rrddump quicktestbin

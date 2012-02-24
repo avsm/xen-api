@@ -45,7 +45,7 @@ let read_msg_parameter msg_parameter =
  
 let debug msg args =
   if !enable_debugging
-  then "D.debug \""^(String.escaped msg)^"\" " ^ (String.concat " " args) ^ ";\n" else "" 
+  then "D.debug \""^(String.escaped msg)^"\" " ^ (String.concat " " args) ^ ";" else "" 
     
 let has_default_args args =
   let arg_has_default arg =
@@ -204,7 +204,7 @@ let operation (obj: obj) (x: message) =
 
 	let gen_body () =
 		let ret = match x.msg_result with Some(ty, _) -> Some ty | _ -> None in
-		let type_xml = XMLRPC.TypeToXML.marshal ret in
+		let type_xml = Datamodel_types.TypeToXML.marshal ret in
 		let module_prefix = if (Gen_empty_custom.operation_requires_side_effect x) then _custom else _db_defaults in
 		let common_let_decs =
 			[
@@ -301,10 +301,15 @@ let gen_module api : O.Module.t =
 		  let allmsg = List.map (fun obj -> String.concat "" (objmsgs obj)) all_objs in
 		  allmsg
 		end @ [
-		  " ]]";
-		"| func -> ";
-		"  " ^ (debug "Unknown rpc \"%s\"" [ "__call" ]);
-		"  Server_helpers.unknown_rpc_failure func";
+			" ]]";
+			"| func -> ";
+			"  if (try Scanf.sscanf func \"system.isAlive:%s\" (fun _ -> true) with _ -> false)";
+			"  then XMLRPC.Success __params";
+			"  else begin";
+			"    if (try Scanf.sscanf func \"unknown-message-%s\" (fun _ -> false) with _ -> true)";
+			"    then " ^ (debug "Unknown rpc \"%s\"" [ "__call" ]);
+			"    Server_helpers.unknown_rpc_failure func";
+			"  end";
 		")))";
 	    ]
 	  ) ()

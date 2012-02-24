@@ -126,9 +126,9 @@ let sr_update dconf driver sr =
   let call = Sm_exec.make_call ~sr_ref:sr dconf "sr_update" [] in
   Sm_exec.parse_unit (Sm_exec.exec_xmlrpc (driver_type driver)  (driver_filename driver) call)
 
-let vdi_create dconf driver sr sm_config vdi_type size name_label name_description =
+let vdi_create dconf driver sr sm_config vdi_type size name_label name_description metadata_of_pool is_a_snapshot snapshot_time snapshot_of read_only =
   debug "vdi_create" driver (sprintf "sr=%s sm_config=[%s] type=[%s] size=%Ld" (Ref.string_of sr) (String.concat "; " (List.map (fun (k, v) -> k ^ "=" ^ v) sm_config)) vdi_type size);
-  let call = Sm_exec.make_call ~sr_ref:sr ~vdi_sm_config:sm_config ~vdi_type dconf "vdi_create" [ sprintf "%Lu" size; name_label ; name_description ] in
+  let call = Sm_exec.make_call ~sr_ref:sr ~vdi_sm_config:sm_config ~vdi_type dconf "vdi_create" [ sprintf "%Lu" size; name_label ; name_description; metadata_of_pool; string_of_bool is_a_snapshot; snapshot_time; snapshot_of; string_of_bool read_only ] in
   Sm_exec.parse_vdi_info (Sm_exec.exec_xmlrpc (driver_type driver)  (driver_filename driver) call)
 
 let vdi_update dconf driver sr vdi = 
@@ -171,7 +171,7 @@ let vdi_snapshot dconf driver driver_params sr vdi =
   let call = Sm_exec.make_call ~sr_ref:sr ~vdi_ref:vdi ~driver_params dconf "vdi_snapshot" [] in
   Sm_exec.parse_vdi_info (Sm_exec.exec_xmlrpc (driver_type driver)  (driver_filename driver) call)
 	
-let vdi_clone dconf driver driver_params context sr vdi =
+let vdi_clone dconf driver driver_params sr vdi =
   debug "vdi_clone" driver (sprintf "sr=%s vdi=%s driver_params=[%s]" (Ref.string_of sr) (Ref.string_of vdi) (String.concat "; " (List.map (fun (k, v) -> k ^ "=" ^ v) driver_params)));
   let call = Sm_exec.make_call ~sr_ref:sr ~vdi_ref:vdi ~driver_params dconf "vdi_clone" [] in
   Sm_exec.parse_vdi_info (Sm_exec.exec_xmlrpc (driver_type driver)  (driver_filename driver) call)
@@ -190,6 +190,11 @@ let vdi_generate_config dconf driver sr vdi =
   debug "vdi_generate_config" driver (sprintf "sr=%s vdi=%s" (Ref.string_of sr) (Ref.string_of vdi));
   let call = Sm_exec.make_call ~sr_ref:sr ~vdi_ref:vdi dconf "vdi_generate_config" [] in
   Sm_exec.parse_string (Sm_exec.exec_xmlrpc (driver_type driver)  (driver_filename driver) call)
+
+let vdi_compose dconf driver sr vdi1 vdi2 =
+	debug "vdi_compose" driver (sprintf "sr=%s vdi1=%s vdi2=%s" (Ref.string_of sr) (Ref.string_of vdi1) (Ref.string_of vdi2));
+	let call = Sm_exec.make_call ~sr_ref:sr ~vdi_ref:vdi2 dconf "vdi_compose" [ Ref.string_of vdi1] in
+	Sm_exec.parse_unit (Sm_exec.exec_xmlrpc (driver_type driver) (driver_filename driver) call)
 
 let session_has_internal_sr_access ~__context ~sr = 
   let session_id = Context.get_session_id __context in
@@ -254,83 +259,4 @@ let sr_content_type ~__context ~sr =
 	 let ty = call_sm_functions ~__context ~sR:sr (fun srconf srtype -> (sr_content_type srconf srtype sr)) in
 	 Hashtbl.replace sr_content_type_cache sr ty;
 	 ty)
-
-(*****************************************************************************)
-(* Storage-related utility functions                                         *)
-
-open Client
-
-(** Call a function 'f' after pausing all VBDs which are currently_attached to a particular VDI.
-    Take care to unpause everything on the way out of the function. 
-    Notes on how the locking is supposed to work:
-    1. The whole disk should be locked against concurrent hotplug attempts
-    2. A disk might be spontaneously unplugged between the point where we example 'currently_attached'
-    and the point where we call VBD.pause -- it is safe to skip over these.
-    3. In Orlando concurrent VM.snapshot calls are allowed (as part of the snapshot-with-quiesce work)
-    we must pause VBDs in order of device number to avoid a deadlock where 'VM.get_VBDs' returns the
-    devices in a different order in a parallel call
-*)
-let with_all_vbds_paused ~__context ~vdis f = 
-  (* We need to keep track of the VBDs we've paused so we can go back and unpause them *)
-  let paused_so_far = ref [] in
-  let vbds = List.concat (List.map (fun vdi -> Db.VDI.get_VBDs ~__context ~self:vdi) vdis) in  
-  let vbds = List.filter 
-    (fun self -> Db.VBD.get_currently_attached ~__context ~self 
-                 && Db.VM.get_power_state ~__context ~self:(Db.VBD.get_VM ~__context ~self) <> `Suspended) 
-    vbds in
-  (* CA-24232: prevent concurrent snapshots of the same VM leading to deadlock since the database
-     doesn't guarantee to return records in the same order. *)
-  let vbds = List.sort (fun a b ->
-			  let a_device = Db.VBD.get_device ~__context ~self:a 
-			  and b_device = Db.VBD.get_device ~__context ~self:b in
-			  compare a_device b_device) vbds in
-  Helpers.call_api_functions ~__context
-    (fun rpc session_id ->
-       finally
-	 (fun () ->
-	    (* Attempt to pause all the VBDs *)
-	    List.iter
-	      (fun vbd ->
-		 (* NB it is possible for a disk to spontaneously unplug itself: 
-		    we are safe to skip these VBDs. *)
-		 (* NB it is possible for a VM to suddenly migrate; if so we retry *)
-		 let finished = ref false in
-		 while not !finished do
-		   try
-			   let token = Client.VBD.pause rpc session_id vbd in
-			   paused_so_far := (vbd, token) :: !paused_so_far;
-			   finished := true
-		   with 
-		   | Api_errors.Server_error(code, _) when code = Api_errors.device_not_attached ->
-		       warn "Not pausing VBD %s because it appears to have spontaneously unplugged" (Ref.string_of vbd);
-		       finished := true
-		   | Api_errors.Server_error(code, _) when code = Api_errors.vm_bad_power_state ->
-		       warn "Not pausing VBD %s because the VM has shutdown" (Ref.string_of vbd);
-		       finished := true
-		   | Api_errors.Server_error(code, [ cls; reference ]) when code = Api_errors.handle_invalid && reference = Ref.string_of vbd ->
-		       warn "Not pausing VBD %s because it has been deleted" reference;
-		       finished := true
-		   | Api_errors.Server_error(code, _) when code = Api_errors.vm_not_resident_here ->
-		       warn "Pausing VBD %s temporarily failed because VM has just migrated; retrying" (Ref.string_of vbd);
-		       (* !finished = false *)
-		   | e ->
-		       error "Error pausing VBD %s: %s" (Ref.string_of vbd) (ExnHelper.string_of_exn e);
-		       raise e (* let this propagate *)
-		 done
-	      ) vbds;
-	    (* Now all the VBDs are paused we can call the main function *)
-	    f ()
-	 )
-	 (fun () ->
-	    (* I would have used Helpers.log_exn_continue but I wanted to log the errors as warnings
-	       and not as only debug messages *)
-	    List.iter
-	      (fun (vbd, token) ->
-		 try Client.VBD.unpause rpc session_id vbd token
-		 with e ->
-		   warn "Failed to unpause VBD %s: %s" (Ref.string_of vbd) (ExnHelper.string_of_exn e))
-	      !paused_so_far
-	 )
-    )
-	 
 

@@ -105,12 +105,12 @@ let string_of_date x = Date.to_string (Date.of_float x)
 module Vdi = struct
 	(** Represents the information known about a VDI *)
 	type t = {
-		physical_device: physical_device option;    (** Some path when attached; None otherwise *)
+		params: params option;    (** Some path when attached; None otherwise *)
 		dps: (Dp.t * Vdi_automaton.state) list; (** state of the VDI from each dp's PoV *)
 		leaked: Dp.t list;                        (** "leaked" dps *)
 	} with rpc
 	let empty () = {
-		physical_device = None;
+		params = None;
 		dps = [];
 		leaked = [];
 	}
@@ -129,6 +129,9 @@ module Vdi = struct
 
 	let get_leaked t = t.leaked
 
+    let leaked t (x: Dp.t) = List.mem x t.leaked
+    let all _ _ = true
+
 	let remove_leaked dp t =
 		{ t with leaked = List.filter (fun u -> u <> dp) t.leaked }
 
@@ -145,7 +148,7 @@ module Vdi = struct
 		set_dp_state dp state' t
 
 	let to_string_list x =
-		let title = Printf.sprintf "%s (device=%s)" (Vdi_automaton.string_of_state (superstate x)) (Opt.default "None" (Opt.map (fun x -> "Some " ^ x) x.physical_device)) in
+		let title = Printf.sprintf "%s (device=%s)" (Vdi_automaton.string_of_state (superstate x)) (Opt.default "None" (Opt.map (fun x -> "Some " ^ x) x.params)) in
 		let of_dp (dp, state) = Printf.sprintf "DP: %s: %s%s" dp (Vdi_automaton.string_of_state state) (if List.mem dp x.leaked then "  ** LEAKED" else "") in
 		title :: (List.map indent (List.map of_dp x.dps))
 end
@@ -242,11 +245,13 @@ module Everything = struct
 end
 
 module Wrapper = functor(Impl: Server_impl) -> struct
-	type context = unit
+	type context = Smint.request
 
 	let expect_unit dp sr vdi x = match x with
 		| Success Unit -> ()
 		| x -> Errors.add dp sr vdi (string_of_result x)
+
+	let query = Impl.query
 
 	module VDI = struct
 		type vdi_locks = (string, unit) Storage_locks.t
@@ -286,12 +291,12 @@ module Wrapper = functor(Impl: Server_impl) -> struct
 							let read_write = (ro_rw = Vdi_automaton.RW) in
 							let result = Impl.VDI.attach context ~task ~dp ~sr ~vdi ~read_write in
 							let result, vdi_t = match result with
-							| Success (Vdi x) ->
-								result, { vdi_t with Vdi.physical_device = Some x }
+							| Success (Params x) ->
+								result, { vdi_t with Vdi.params = Some x }
 							| Success Unit
 							| Failure _ ->
 								result, vdi_t
-							| Success (State _) ->
+							| Success (Stat _ | Vdi _ | Vdis _ | String _)->
 								Failure (Internal_error (Printf.sprintf "VDI.attach type error, received: %s" (string_of_result result))), vdi_t in
 								result, vdi_t
 							| Vdi_automaton.Activate ->
@@ -335,7 +340,7 @@ module Wrapper = functor(Impl: Server_impl) -> struct
 					(* NB this_op = attach but ops = [] because the disk is already attached *)
 					let result = match result, this_op with
 						| Success _, Vdi_automaton.Attach _ ->
-							Success (Vdi (Opt.unbox vdi_t.Vdi.physical_device))
+							Success (Params (Opt.unbox vdi_t.Vdi.params))
 						| x, _ -> x in
 					
 					result, vdi_t
@@ -395,17 +400,17 @@ module Wrapper = functor(Impl: Server_impl) -> struct
 				end
 
 		(* Attempt to clear leaked datapaths associed with this vdi *)
-		let remove_leaked_datapaths_andthen_nolock context ~task ~sr ~vdi next =
+		let remove_datapaths_andthen_nolock context ~task ~sr ~vdi which next =
 			let dps = match Host.find sr !Host.host with
 			| None -> []
 			| Some sr_t ->
 				begin match Sr.find vdi sr_t with
 				| Some vdi_t ->
-					Vdi.get_leaked vdi_t
+					List.filter (which vdi_t) (Vdi.dps vdi_t)
 				| None -> []
 				end in
 			let failures = List.fold_left (fun acc dp ->
-				info "Attempting to destroy leaked datapath dp:%s sr:%s vdi:%s" dp sr vdi;
+				info "Attempting to destroy datapath dp:%s sr:%s vdi:%s" dp sr vdi;
 				match destroy_datapath_nolock context ~task ~dp ~sr ~vdi ~allow_leak:false with
 				| Success _ -> acc
 				| Failure f -> f :: acc
@@ -418,7 +423,7 @@ module Wrapper = functor(Impl: Server_impl) -> struct
 			info "VDI.attach task:%s dp:%s sr:%s vdi:%s read_write:%b" task dp sr vdi read_write;
 			with_vdi sr vdi
 				(fun () ->
-					remove_leaked_datapaths_andthen_nolock context ~task ~sr ~vdi
+					remove_datapaths_andthen_nolock context ~task ~sr ~vdi Vdi.leaked
 						(fun () ->
 							fst(perform_nolock context ~task ~dp ~sr ~vdi
 								(Vdi_automaton.Attach (if read_write then Vdi_automaton.RW else Vdi_automaton.RO)))))
@@ -426,37 +431,106 @@ module Wrapper = functor(Impl: Server_impl) -> struct
 			info "VDI.activate task:%s dp:%s sr:%s vdi:%s" task dp sr vdi;
 			with_vdi sr vdi
 				(fun () ->
-					remove_leaked_datapaths_andthen_nolock context ~task ~sr ~vdi
+					remove_datapaths_andthen_nolock context ~task ~sr ~vdi Vdi.leaked
 						(fun () ->
 							fst(perform_nolock context ~task ~dp ~sr ~vdi Vdi_automaton.Activate)))
 
-		let stat context ~task ?dp ~sr ~vdi () =
-			info "VDI.stat task:%s dp:%s sr:%s vdi:%s" task (Opt.default "superstate" dp) sr vdi;
+		let stat context ~task ~sr ~vdi () =
+			info "VDI.stat task:%s sr:%s vdi:%s" task sr vdi;
 			with_vdi sr vdi
 				(fun () ->
 					match Host.find sr !Host.host with
 					| None -> Failure Sr_not_attached
 					| Some sr_t ->
 						let vdi_t = Opt.default (Vdi.empty ()) (Sr.find vdi sr_t) in
-						match dp with
-						| None -> Success (State (Vdi.superstate vdi_t))
-						| Some dp -> Success (State (Vdi.get_dp_state dp vdi_t))
+						Success (Stat {
+							superstate = Vdi.superstate vdi_t;
+							dps = List.map (fun dp -> dp, Vdi.get_dp_state dp vdi_t) (Vdi.dps vdi_t)
+						})
 				)
 
 		let deactivate context ~task ~dp ~sr ~vdi =
 			info "VDI.deactivate task:%s dp:%s sr:%s vdi:%s" task dp sr vdi;
 			with_vdi sr vdi
 				(fun () ->
-					remove_leaked_datapaths_andthen_nolock context ~task ~sr ~vdi
+					remove_datapaths_andthen_nolock context ~task ~sr ~vdi Vdi.leaked
 						(fun () ->
 							fst (perform_nolock context ~task ~dp ~sr ~vdi Vdi_automaton.Deactivate)))
 		let detach context ~task ~dp ~sr ~vdi =
 			info "VDI.detach task:%s dp:%s sr:%s vdi:%s" task dp sr vdi;
 			with_vdi sr vdi
 				(fun () ->
-					remove_leaked_datapaths_andthen_nolock context ~task ~sr ~vdi
+					remove_datapaths_andthen_nolock context ~task ~sr ~vdi Vdi.leaked
 						(fun () ->
 							fst (perform_nolock context ~task ~dp ~sr ~vdi Vdi_automaton.Detach)))
+
+        let create context ~task ~sr ~vdi_info ~params =
+            info "VDI.create task:%s sr:%s vdi_info:%s params:%s" task sr (string_of_vdi_info vdi_info) (String.concat "; " (List.map (fun (k, v) -> k ^ ":" ^ v) params));
+            let result = Impl.VDI.create context ~task ~sr ~vdi_info ~params in
+            match result with
+                | Success (Vdi { virtual_size = virtual_size' }) when virtual_size' < vdi_info.virtual_size ->
+                    error "VDI.create task:%s created a smaller VDI (%Ld)" task virtual_size';
+                    Failure(Backend_error("SR_BACKEND_FAILURE", ["Disk too small"; Int64.to_string vdi_info.virtual_size; Int64.to_string virtual_size']))
+                | result -> result
+
+		let snapshot_and_clone call_name call_f context ~task ~sr ~vdi ~vdi_info ~params =
+			info "%s task:%s sr:%s vdi:%s vdi_info:%s params:%s" call_name task sr vdi (string_of_vdi_info vdi_info) (String.concat ";" (List.map (fun (k, v) -> k ^ ":" ^ v) params));
+			with_vdi sr vdi
+				(fun () ->
+					call_f context ~task ~sr ~vdi ~vdi_info ~params
+				)
+
+		let snapshot = snapshot_and_clone "VDI.snapshot" Impl.VDI.snapshot
+		let clone = snapshot_and_clone "VDI.clone" Impl.VDI.clone
+
+        let destroy context ~task ~sr ~vdi =
+            info "VDI.destroy task:%s sr:%s vdi:%s" task sr vdi;
+            with_vdi sr vdi
+                (fun () ->
+                    remove_datapaths_andthen_nolock context ~task ~sr ~vdi Vdi.all
+                        (fun () ->
+                            Impl.VDI.destroy context ~task ~sr ~vdi
+                        )
+                )
+
+		let get_by_name context ~task ~sr ~name =
+			info "VDI.get_by_name task:%s sr:%s name:%s" task sr name;
+			Impl.VDI.get_by_name context ~task ~sr ~name
+
+		let set_content_id context ~task ~sr ~vdi ~content_id =
+			info "VDI.set_content_id task:%s sr:%s vdi:%s content_id:%s" task sr vdi content_id;
+			Impl.VDI.set_content_id context ~task ~sr ~vdi ~content_id
+
+		let similar_content context ~task ~sr ~vdi =
+			info "VDI.similar_content task:%s sr:%s vdi:%s" task sr vdi;
+			Impl.VDI.similar_content context ~task ~sr ~vdi
+
+		let compose context ~task ~sr ~vdi1 ~vdi2 =
+			info "VDI.compose task:%s sr:%s vdi1:%s vdi2:%s" task sr vdi1 vdi2;
+			Impl.VDI.compose context ~task ~sr ~vdi1 ~vdi2
+
+		let copy context ~task ~sr ~vdi ~url ~dest =
+			info "VDI.copy task:%s sr:%s vdi:%s url:%s dest:%s" task sr vdi url dest;
+			Impl.VDI.copy context ~task ~sr ~vdi ~url ~dest
+
+		let get_url context ~task ~sr ~vdi =
+			info "VDI.get_url task:%s sr:%s vdi:%s" task sr vdi;
+			Impl.VDI.get_url context ~task ~sr ~vdi
+
+	end
+
+	let get_by_name context ~task ~name =
+		debug "get_by_name task:%s name:%s" task name;
+		Impl.get_by_name context ~task ~name
+
+	module Mirror = struct
+		let start context ~task ~sr ~vdi ~url ~dest =
+			info "Mirror.start task:%s sr:%s vdi:%s url:%s dest:%s" task sr vdi url dest;
+			Impl.Mirror.start context ~task ~sr ~vdi ~url ~dest
+
+		let stop context ~task ~sr ~vdi =
+			info "Mirror.stop task:%s sr:%s vdi:%s" task sr vdi;
+			Impl.Mirror.stop context ~task ~sr ~vdi
 	end
 
 	module DP = struct
@@ -502,11 +576,11 @@ module Wrapper = functor(Impl: Server_impl) -> struct
 			let of_sr (sr, sr_t) =
 				let title = Printf.sprintf "SR %s" sr in
 				title :: (List.map indent (Sr.to_string_list sr_t)) in
-				let srs = List.concat (List.map of_sr srs) in
-				let errors = List.map Errors.to_string (Errors.list ()) in
-				let errors = (if errors <> [] then "The following errors have been logged:" else "No errors have been logged.") :: errors in
-				let lines = [ "The following SRs are attached:" ] @ (List.map indent srs) @ [ "" ] @ errors in
-				String.concat "" (List.map (fun x -> x ^ "\n") lines)
+			let srs = List.concat (List.map of_sr srs) in
+			let errors = List.map Errors.to_string (Errors.list ()) in
+			let errors = (if errors <> [] then "The following errors have been logged:" else "No errors have been logged.") :: errors in
+			let lines = [ "The following SRs are attached:" ] @ (List.map indent srs) @ [ "" ] @ errors in
+			Success (String (String.concat "" (List.map (fun x -> x ^ "\n") lines)))
 	end
 
 	module SR = struct
@@ -516,13 +590,23 @@ module Wrapper = functor(Impl: Server_impl) -> struct
 		let list context ~task =
 			List.map fst (Host.list !Host.host)
 
-		let attach context ~task ~sr =
-			info "SR.attach task:%s sr:%s" task sr;
+		let scan context ~task ~sr =
+			info "SR.scan task:%s sr:%s" task sr;
+			with_sr sr
+				(fun () ->
+					match Host.find sr !Host.host with
+						| None -> Failure Sr_not_attached
+						| Some _ ->
+							Impl.SR.scan context ~task ~sr
+				)
+
+		let attach context ~task ~sr ~device_config =
+			info "SR.attach task:%s sr:%s device_config:[%s]" task sr (String.concat "; " (List.map (fun (k, v) -> k ^ ":" ^ v) device_config));
 			with_sr sr
 				(fun () ->
 					match Host.find sr !Host.host with
 					| None ->
-						begin match Impl.SR.attach context ~task ~sr with
+						begin match Impl.SR.attach context ~task ~sr ~device_config with
 						| Success Unit ->
 							Host.replace sr (Sr.empty ()) !Host.host;
 							(* FH1: Perform the side-effect first: in the case of a
@@ -577,6 +661,16 @@ module Wrapper = functor(Impl: Server_impl) -> struct
 			info "SR.detach task:%s sr:%s" task sr;
 			detach_destroy_common context ~task ~sr Impl.SR.detach
 
+		let reset context ~task ~sr =
+			info "SR.reset task:%s sr:%s" task sr;
+			with_sr sr
+				(fun () ->
+					Host.remove sr !Host.host;
+					Everything.to_file !host_state_path (Everything.make ());
+					VDI.locks_remove sr;
+					Success Unit			
+				)
+
 		let destroy context ~task ~sr = 
 			info "SR.destroy task:%s sr:%s" task sr;
 			detach_destroy_common context ~task ~sr Impl.SR.destroy			
@@ -595,33 +689,32 @@ let initialise () =
 	end else info "No storage state is persisted in %s; creating blank database" !host_state_path
 
 module Local_domain_socket = struct
-	(** Code to create a standalone process listening on a Unix domain socket.
-	    WARNING: the http server uses a global table of URI -> handlers so there
-	    is NO WAY to separate the XenAPI handlers from these ones. Therefore
-	    never turn this code on in xapi! *)
-	let server = ref None
+	(** Code to create a standalone process listening on a Unix domain socket. *)
+	let server = Http_svr.Server.empty ()
 
-	let path = "/var/xapi/storage"
+	let socket = ref None
 
-	let xmlrpc_handler process req bio =
+	let path = Filename.concat Fhs.vardir "storage"
+
+	let xmlrpc_handler process req bio _ =
 		let body = Http_svr.read_body req bio in
 		let s = Buf_io.fd_of bio in
 		let rpc = Xmlrpc.call_of_string body in
 		(* Printf.fprintf stderr "Request: %s %s\n%!" rpc.Rpc.name (Rpc.to_string (List.hd rpc.Rpc.params)); *)
-		let result = process () rpc in
+		let result = process (Some req.Http.Request.uri) rpc in
 		(* Printf.fprintf stderr "Response: %s\n%!" (Rpc.to_string result.Rpc.contents); *)
 		let str = Xmlrpc.string_of_response result in
 		Http_svr.response_str req s str
 
 	let start path process =
+		Http_svr.Server.add_handler server Http.Post "/" (Http_svr.BufIO (xmlrpc_handler process));
 		Unixext.mkdir_safe (Filename.dirname path) 0o700;
 		Unixext.unlink_safe path;
-		let domain_sock = Http_svr.bind (Unix.ADDR_UNIX(path)) in
-		server := Some (Http_svr.start (domain_sock, "unix-RPC"));
-		Http_svr.add_handler Http.Post "/" (Http_svr.BufIO (xmlrpc_handler process))
-
+		let domain_sock = Http_svr.bind (Unix.ADDR_UNIX(path)) "storage_unix" in
+		Http_svr.start server domain_sock;
+		socket := Some(domain_sock)
 
 	let shutdown () =
-		Opt.iter Http_svr.stop !server;
-		server := None
+		Opt.iter Http_svr.stop !socket;
+		socket := None
 end

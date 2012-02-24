@@ -30,12 +30,9 @@ let no_exn f x =
     debug "Ignoring exception: %s" (ExnHelper.string_of_exn exn)
 
 let rpc host_address xml =
-	let open Xmlrpcclient in
 	try
-		let transport = SSL(SSL.make (), host_address, !Xapi_globs.https_port) in
-		let http = xmlrpc ~version:"1.0" "/" in
-		XML_protocol.rpc ~transport ~http xml
-	with Connection_reset ->
+		Helpers.make_remote_rpc host_address xml
+	with Xmlrpc_client.Connection_reset ->
 		raise (Api_errors.Server_error(Api_errors.pool_joining_host_connection_failed, []))
 
 let get_master ~rpc ~session_id =
@@ -149,29 +146,48 @@ let pre_join_checks ~__context ~rpc ~session_id ~force =
 		end in
 
 	let assert_management_interface_is_physical () =
-		let pifs = Db.PIF.get_all_records ~__context in
-		if List.exists (fun (_,pifr)-> pifr.API.pIF_management && not pifr.API.pIF_physical) pifs then begin
+		let pifs = Db.PIF.get_refs_where ~__context ~expr:(And (
+			Eq (Field "management", Literal "true"),
+			Eq (Field "physical", Literal "false")
+		)) in
+		if pifs <> [] then begin
 			error "The current host has a management interface which is not physical: cannot join a new pool";
 			raise (Api_errors.Server_error(Api_errors.pool_joining_host_must_have_physical_managment_nic, []));
 		end in
 
-	let assert_product_version_matches () = 
+	(* Used to tell XCP and XenServer apart - use PRODUCT_BRAND if present, else use PLATFORM_NAME. *)
+	let get_compatibility_name software_version =
+		if List.mem_assoc Xapi_globs._product_brand software_version then
+			Some (List.assoc Xapi_globs._product_brand software_version)
+		else if List.mem_assoc Xapi_globs._platform_name software_version then
+			Some (List.assoc Xapi_globs._platform_name software_version)
+		else
+			None
+	in
+
+	let assert_hosts_compatible () =
 		let me = Db.Host.get_record ~__context ~self:(Helpers.get_localhost ~__context) in
 		let master_ref = get_master rpc session_id in
 		let master = Client.Host.get_record ~rpc ~session_id ~self:master_ref in
 		let my_software_version = me.API.host_software_version in
 		let master_software_version = master.API.host_software_version in
-		let product_version x = 
-			if List.mem_assoc "product_version" x
-			then Some (List.assoc "product_version" x)
-			else None in
-		let master_product_version = product_version master_software_version in
-		let my_product_version = product_version my_software_version in
-		if master_product_version <> my_product_version then begin
-			debug "master PRODUCT_VERSION = %s; my PRODUCT_VERSION = %s" 
-				(Opt.default "Unknown" master_product_version)
-				(Opt.default "Unknown" my_product_version);
-			raise (Api_errors.Server_error(Api_errors.pool_joining_host_must_have_same_product_version, []))
+		let compatibility_info x =
+			let open Xapi_globs in
+			let platform_version = if List.mem_assoc _platform_version x
+				then Some (List.assoc _platform_version x)
+				else None in
+			let compatibility_name = get_compatibility_name x in
+			(platform_version, compatibility_name)
+		in
+		let master_compatibility_info = compatibility_info master_software_version in
+		let my_compatibility_info = compatibility_info my_software_version in
+		if master_compatibility_info <> my_compatibility_info then begin
+			debug "master PLATFORM_VERSION = %s, master compatibility name = %s; my PLATFORM_VERSION = %s, my compatibility name = %s; "
+				(Opt.default "Unknown" (fst master_compatibility_info))
+				(Opt.default "Unknown" (snd master_compatibility_info))
+				(Opt.default "Unknown" (fst my_compatibility_info))
+				(Opt.default "Unknown" (snd my_compatibility_info));
+			raise (Api_errors.Server_error(Api_errors.pool_hosts_not_compatible, []))
 		end in
 
 	let assert_hosts_homogeneous () =
@@ -182,17 +198,18 @@ let pre_join_checks ~__context ~rpc ~session_id ~force =
 		(* Check software version *)
 					
 		let get_software_version_fields fields =
-			begin try List.assoc "product_version" fields with _ -> "" end,
-			begin try List.assoc "product_brand" fields with _ -> "" end,
-			begin try List.assoc "build_number" fields with _ -> "" end,
-			begin try List.assoc "hg_id" fields with _ -> "" end,
-			begin try 
-				if List.mem_assoc Xapi_globs.linux_pack_vsn_key fields then "installed"
+			let open Xapi_globs in
+			begin try List.assoc _platform_version fields with _ -> "" end,
+			begin match get_compatibility_name fields with Some x -> x | None -> "" end,
+			begin try List.assoc _build_number fields with _ -> "" end,
+			begin try List.assoc _git_id fields with _ -> "" end,
+			begin try
+				if List.mem_assoc linux_pack_vsn_key fields then "installed"
 				else "not present"
 			with _ -> "not present" end
 		in
-		let print_software_version (version,brand,number,id,linux_pack) =
-			debug "version:%s, brand:%s, build:%s, id:%s, linux_pack:%s" version brand number id linux_pack in
+		let print_software_version (version,name,number,id,linux_pack) =
+			debug "version:%s, name:%s, build:%s, id:%s, linux_pack:%s" version name number id linux_pack in
 			
 		let master_software_version = master.API.host_software_version in
 		let my_software_version = Db.Host.get_software_version ~__context ~self:me in
@@ -296,7 +313,7 @@ let pre_join_checks ~__context ~rpc ~session_id ~force =
 	assert_i_know_of_no_other_hosts();
 	assert_no_running_vms_on_me ();
 	assert_no_vms_with_current_ops ();
-	assert_product_version_matches ();
+	assert_hosts_compatible ();
 	if (not force) then assert_hosts_homogeneous ();
 	assert_no_shared_srs_on_me ();
 	assert_management_interface_is_physical ();
@@ -446,17 +463,26 @@ let create_or_get_vdi_on_master __context rpc session_id (vdi_ref, vdi) : API.re
 				~other_config:vdi.API.vDI_other_config
 				~location:(Db.VDI.get_location ~__context ~self:vdi_ref)
 				~xenstore_data:vdi.API.vDI_xenstore_data
-				~sm_config:vdi.API.vDI_sm_config in
-
+				~sm_config:vdi.API.vDI_sm_config
+				~managed:vdi.API.vDI_managed
+				~virtual_size:vdi.API.vDI_virtual_size
+				~physical_utilisation:vdi.API.vDI_physical_utilisation
+				~metadata_of_pool:vdi.API.vDI_metadata_of_pool
+				~is_a_snapshot:vdi.API.vDI_is_a_snapshot
+				~snapshot_time:vdi.API.vDI_snapshot_time
+				~snapshot_of:vdi.API.vDI_snapshot_of in
 	new_vdi_ref
 
 let create_or_get_network_on_master __context rpc session_id (network_ref, network) : API.ref_network =
 	let my_bridge = network.API.network_bridge in
 
 	let new_network_ref =
-		if String.startswith "xenbr" my_bridge then
-			(* Physical network: try to join an existing one with the same bridge name, or create one.
-			 * This relies on the convention that PIFs with the same label need to be connected. *)
+		if String.startswith "xenbr" my_bridge || my_bridge = "xenapi" then
+			(* Physical network or Host Internal Management Network:
+			 * try to join an existing network with the same bridge name, or create one.
+			 * This relies on the convention that PIFs with the same device name need to be connected.
+			 * Furthermore, there should be only one Host Internal Management Network in a pool, and it
+			 * should always have bridge name "xenapi". *)
 			try
 				let pool_networks = Client.Network.get_all_records ~rpc ~session_id in
 				let net_ref, _ = List.find (fun (_, net) -> net.API.network_bridge = my_bridge) pool_networks in
@@ -568,8 +594,9 @@ let update_non_vm_metadata ~__context ~rpc ~session_id =
 		List.map (protect_exn (create_or_get_network_on_master __context rpc session_id)) my_networks in
 
 	(* update PIFs *)
-	let my_pifs = Db.PIF.get_all_records ~__context in
-	let my_pifs = List.filter (fun (_, pif) -> pif.API.pIF_physical) my_pifs in
+	let my_pifs = Db.PIF.get_records_where ~__context ~expr:(
+		Eq (Field "physical", Literal "true")
+	) in
 	let (_ : API.ref_PIF option list) =
 		List.map (protect_exn (create_or_get_pif_on_master __context rpc session_id)) my_pifs in
 
@@ -580,36 +607,6 @@ let update_non_vm_metadata ~__context ~rpc ~session_id =
 	in
 
 	()
-
-let update_vm_metadata ~__context ~rpc ~session_id ~master_address =
-	let subtask_of = (Ref.string_of (Context.get_task_id __context)) in
-
-	let open Xmlrpcclient in
-
-	Helpers.call_api_functions ~__context (fun my_rpc my_session_id ->
-		let get = Xapi_http.http_request ~version:"1.0" ~subtask_of
-			~cookie:["session_id", Ref.string_of my_session_id] ~keep_alive:false
-			Http.Get
-			(Printf.sprintf "%s?all=true" Constants.export_metadata_uri) in
-		let put = Xapi_http.http_request ~version:"1.0" ~subtask_of
-			~cookie:["session_id", Ref.string_of session_id] ~keep_alive:false
-			Http.Put
-			(Printf.sprintf "%s?restore=true" Constants.import_metadata_uri) in
-		debug "Piping HTTP %s to %s" (Http.Request.to_string get) (Http.Request.to_string put);
-		with_transport (Unix Xapi_globs.unix_domain_socket)
-			(with_http get
-				(fun (r, ifd) ->
-					let put = { put with Http.Request.content_length = r.Http.Response.content_length } in
-					with_transport (SSL (SSL.make (), master_address, !Xapi_globs.https_port))
-						(with_http put
-							(fun (_, ofd) ->
-								let (_: int64) = Unixext.copy_file ?limit:r.Http.Response.content_length ifd ofd in
-								()
-							)
-						)
-				)
-			)
-	)
 
 let join_common ~__context ~master_address ~master_username ~master_password ~force =
 	(* get hold of cluster secret - this is critical; if this fails whole pool join fails *)
@@ -640,7 +637,7 @@ let join_common ~__context ~master_address ~master_username ~master_password ~fo
 		on with the join *)
 		try
 			update_non_vm_metadata ~__context ~rpc ~session_id;
-			update_vm_metadata ~__context ~rpc ~session_id ~master_address;
+			Importexport.remote_metadata_export_import ~__context ~rpc ~session_id ~remote_address:master_address `All
 		with e ->
 			debug "Error whilst importing db objects into master; aborted: %s" (Printexc.to_string e);
 			warn "Error whilst importing db objects to master. The pool-join operation will continue, but some of the slave's VMs may not be available on the master.")
@@ -989,8 +986,6 @@ let create_VLAN ~__context ~device ~network ~vLAN =
 		| Api_errors.Server_error (a,b) ->
 		    if a=Api_errors.host_offline 
 		    then
-		      let metrics = Db.PIF.get_metrics ~__context ~self:pif in
-		      Db.PIF_metrics.destroy ~__context ~self:metrics;
 		      Db.PIF.destroy ~__context ~self:pif
 		    else
 		      (* If theres any other error, leave the PIF to be destroyed

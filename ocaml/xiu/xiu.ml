@@ -14,6 +14,8 @@
 open Printf
 open Pervasiveext
 open Threadext
+open Xenbus
+open Xenstore
 
 type inject_error_ty =
 	| Inject_error_create
@@ -219,7 +221,7 @@ module Udev = struct
     | _, _ -> eprintf "(XIU) unknown error running udev script\n"
 
   let vif domid devid device action = 
-    let vif_script = "/etc/xensource/scripts/vif" in
+    let vif_script = Filename.concat Fhs.scriptsdir "vif" in
     let env = 
       [ "DEVPATH", sprintf "/devices/xen-backend/vif-%d-%d" domid devid;
 	"PHYSDEVBUS", "xen-backend";
@@ -227,7 +229,7 @@ module Udev = struct
 	"XENBUS_BASE_PATH", "backend";
 	"XENBUS_PATH", sprintf "backend/vif/%d/%d" domid devid;
 	"XENBUS_TYPE", "vif";
-	"PATH", Xapi_globs.base_path ^ "/bin:/usr/local/bin:/bin:/usr/bin"; (* added <base_path>/bin for xenstore wrapper *)
+	"PATH", Fhs.bindir ^ ":/usr/local/bin:/bin:/usr/bin"; (* added @BINDIR@ for xenstore wrapper *)
 	"XIU", !xiu_path; (* make sure we pick up the fake list_domains *)
 	"vif", device
       ] in
@@ -237,7 +239,7 @@ end
 
 (** thread simulating a domain *)
 let thread_domain0 () =
-	let read_state xs w = try Xenbus.of_int (int_of_string (xs.Xs.read w)) with _ -> Xenbus.Unknown in
+	let read_state xs w = try Xenbus_utils.of_int (int_of_string (xs.Xs.read w)) with _ -> Xenbus_utils.Unknown in
 
 	let backend_changed xs w =
 		let l = Stringext.String.split '/' w in
@@ -246,7 +248,7 @@ let thread_domain0 () =
 			let state = read_state xs w in
 			add_console (sprintf "dom0: backend ty=%s id=%s for domid=%s changed" ty id domid);
 			match state with
-			| Xenbus.Initialising ->
+			| Xenbus_utils.Initialising ->
 				let hotplugpath = sprintf "/xapi/%s/hotplug/%s/%s/hotplug" domid ty id in
 				if ty = "vif" then (
 					let vifpath = sprintf "/xapi/%s/hotplug/%s/%s/vif" domid ty id in
@@ -270,10 +272,10 @@ let thread_domain0 () =
 				) else (
 				  xs.Xs.write hotplugpath "online";
 				);
-				xs.Xs.write w (Xenbus.string_of Xenbus.InitWait);
-			| Xenbus.InitWait -> ()
-			| Xenbus.Closing ->
-				xs.Xs.write w (Xenbus.string_of Xenbus.Closed);
+				xs.Xs.write w (Xenbus_utils.string_of Xenbus_utils.InitWait);
+			| Xenbus_utils.InitWait -> ()
+			| Xenbus_utils.Closing ->
+				xs.Xs.write w (Xenbus_utils.string_of Xenbus_utils.Closed);
 				if ty = "vif" then (
 					let device_path = sprintf "/xapi/%s/hotplug/vif/%s/vif" domid id in
 					let device = xs.Xs.read device_path in
@@ -291,7 +293,7 @@ let thread_domain0 () =
 		| "" :: "local" :: "domain" :: "0" :: "backend" :: "vif" :: domid :: id :: [ "online" ] -> (
 			let online_path = sprintf "/local/domain/0/backend/vif/%s/%s/online" domid id in
 			let state_path = sprintf "/local/domain/0/backend/vif/%s/%s/state" domid id in
-			if xs.Xs.read online_path = "0" then xs.Xs.write state_path (Xenbus.string_of Xenbus.Closing)
+			if xs.Xs.read online_path = "0" then xs.Xs.write state_path (Xenbus_utils.string_of Xenbus_utils.Closing)
 			)
 		| "" :: "local" :: "domain" :: "0" :: "backend" :: ty :: domid :: id :: [ "shutdown-request" ] -> (
 			let sdone_path = sprintf "/local/domain/0/backend/%s/%s/%s/shutdown-done" ty domid id in
@@ -324,8 +326,8 @@ let thread_domain0 () =
 			let backend_state_path = backend_path ^ "/state" in
 			let fstate = read_state xs w in
 			match fstate with
-			| Xenbus.Initialised -> xs.Xs.write backend_state_path (Xenbus.string_of Xenbus.Connected)
-			| Xenbus.Closing     -> xs.Xs.write backend_state_path (Xenbus.string_of Xenbus.Closed)
+			| Xenbus_utils.Initialised -> xs.Xs.write backend_state_path (Xenbus_utils.string_of Xenbus_utils.Connected)
+			| Xenbus_utils.Closing     -> xs.Xs.write backend_state_path (Xenbus_utils.string_of Xenbus_utils.Closed)
 			| _                  -> ()
 			)
 		| _ ->
@@ -393,7 +395,7 @@ let thread_domain domid =
 	let mypath = sprintf "/local/domain/%d/" domid in
 	let shutdowning = ref None in
 
-	let read_state xs w = try Xenbus.of_int (int_of_string (xs.Xs.read w)) with _ -> Xenbus.Unknown in
+	let read_state xs w = try Xenbus_utils.of_int (int_of_string (xs.Xs.read w)) with _ -> Xenbus_utils.Unknown in
 	let backend_changed xs w =
 		let l = Stringext.String.split '/' w in
 		match l with
@@ -402,9 +404,9 @@ let thread_domain domid =
 			let frontend_state_path = frontend_path ^ "/state" in
 			let bstate = read_state xs w in
 			match bstate with
-			| Xenbus.InitWait  -> xs.Xs.write frontend_state_path (Xenbus.string_of Xenbus.Initialised)
-			| Xenbus.Connected -> xs.Xs.write frontend_state_path (Xenbus.string_of Xenbus.Connected)
-			| Xenbus.Closing   -> xs.Xs.write frontend_state_path (Xenbus.string_of Xenbus.Closed)
+			| Xenbus_utils.InitWait  -> xs.Xs.write frontend_state_path (Xenbus_utils.string_of Xenbus_utils.Initialised)
+			| Xenbus_utils.Connected -> xs.Xs.write frontend_state_path (Xenbus_utils.string_of Xenbus_utils.Connected)
+			| Xenbus_utils.Closing   -> xs.Xs.write frontend_state_path (Xenbus_utils.string_of Xenbus_utils.Closed)
 			| _                -> ()
 			)
 		| _ ->
@@ -436,8 +438,8 @@ let thread_domain domid =
 				let state_path = idpath ^ "/" ^ id ^ "/state" in
 				let state = read_state xs state_path in
 				match state with
-				| Xenbus.Initialised | Xenbus.InitWait | Xenbus.Initialising | Xenbus.Connected ->
-					xs.Xs.write state_path (Xenbus.string_of Xenbus.Closing)
+				| Xenbus_utils.Initialised | Xenbus_utils.InitWait | Xenbus_utils.Initialising | Xenbus_utils.Connected ->
+					xs.Xs.write state_path (Xenbus_utils.string_of Xenbus_utils.Closing)
 				| _ -> ()
 			) ids
 		) devices
@@ -856,7 +858,7 @@ let main xiu_path =
 	()
 
 let _ =
-	let config_file = ref "/etc/xensource/xiu.conf" in
+	let config_file = ref (Filename.concat Fhs.etcdir "xiu.conf") in
 	let other_args = ref [] in
 	Arg.parse [ "-v", Arg.Unit (fun () -> incr debug_level), "increase debug level";
 	            "--conf", Arg.Set_string config_file, "set config file"; ]

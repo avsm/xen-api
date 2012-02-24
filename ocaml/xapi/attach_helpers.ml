@@ -24,8 +24,11 @@ let timeout = 300. (* 5 minutes, should never take this long *)
 let safe_unplug rpc session_id self = 
   try
     Client.VBD.unplug rpc session_id self
-  with Api_errors.Server_error(error, _) as e when error = Api_errors.device_detach_rejected ->
-    debug "safe_unplug caught device_detach_rejected: polling the currently_attached flag of the VBD";
+  with
+	  | Api_errors.Server_error(error, _) when error = Api_errors.device_already_detached ->
+		  debug "safe_unplug caught DEVICE_ALREADY_DETACHED: this is safe to ignore"
+	  | Api_errors.Server_error(error, _) as e when error = Api_errors.device_detach_rejected ->
+    debug "safe_unplug caught DEVICE_DETACH_REJECTED: polling the currently_attached flag of the VBD";
     let start = Unix.gettimeofday () in
     let unplugged = ref false in
     while not(!unplugged) && (Unix.gettimeofday () -. start < timeout) do
@@ -37,22 +40,35 @@ let safe_unplug rpc session_id self =
       raise e
     end
 
-(** For a VBD attached to a control domain, check to see if a valid task_id is present in
-    the other-config. If a VBD exists for a task which has been cancelled or deleted then
-    we assume the VBD has leaked. *)
-let has_vbd_leaked __context vbd = 
-  let other_config = Db.VBD.get_other_config ~__context ~self:vbd in
-  let device = Db.VBD.get_device ~__context ~self:vbd in
-  if not(List.mem_assoc Xapi_globs.vbd_task_key other_config)
-  then (warn "dom0 block-attached disk has no task reference - who made it? device = %s" device; false)
-  else
-    let task_id = Ref.of_string (List.assoc Xapi_globs.vbd_task_key other_config) in
-    (* check if the task record still exists and is pending *)
-    try 
-      let status = Db.Task.get_status ~__context ~self:task_id in
-      not(List.mem status [ `pending; `cancelling ]) (* pending and cancelling => not leaked *)
-    with _ -> true (* task record gone, must have leaked *)
-      
+(** For a VBD attached to a control domain, it may correspond to a running task
+	(if so the task will be linked via an other_config key) or it may be a qemu
+	frontend (if so it will be linked to another frontend) *)
+let has_vbd_leaked __context vbd =
+	let other_config = Db.VBD.get_other_config ~__context ~self:vbd in
+	let device = Db.VBD.get_device ~__context ~self:vbd in
+	let has_task = List.mem_assoc Xapi_globs.vbd_task_key other_config in
+	let has_related = List.mem_assoc Xapi_globs.related_to_key other_config in
+	if not has_task && (not has_related)
+	then (info "Ignoring orphaned disk attached to control domain (device = %s)" device; false)
+	else begin
+		let has_valid_task = has_task && (
+			let task_id = Ref.of_string (List.assoc Xapi_globs.vbd_task_key other_config) in			
+			(* check if the task record still exists and is pending *)
+			try
+				let status = Db.Task.get_status ~__context ~self:task_id in
+				List.mem status [ `pending; `cancelling ] (* pending and cancelling => not leaked *)
+			with _ -> false (* task record gone *)
+		) in
+		let has_valid_related = has_related && (
+			let related = Ref.of_string (List.assoc Xapi_globs.related_to_key other_config) in
+			(* check if the VBD still exists and is currently_attached *)
+			try
+				Db.VBD.get_currently_attached ~__context ~self:related
+			with _ -> false (* VBD record gone *)
+		) in
+		(* leaked if neither of the two keys are still valid *)
+		not has_valid_task && (not has_valid_related)
+	end
 
 (** Execute a function with a list of VBDs after attaching a bunch of VDIs to an vm *)
 let with_vbds rpc session_id __context vm vdis mode f = 

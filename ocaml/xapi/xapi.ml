@@ -23,7 +23,8 @@ open Pervasiveext
 open Listext
 open Auth_signature
 open Extauth
-
+open Xenstore
+open Db_filter_types
 
 module D=Debug.Debugger(struct let name="xapi" end)
 open D
@@ -39,7 +40,7 @@ let check_control_domain () =
   let uuid = Xapi_inventory.lookup Xapi_inventory._control_domain_uuid in
   if domuuid <> uuid then (
     info "dom0 uuid mismatch with inventory -- setting it the proper value";
-    with_xc (fun xc -> Xc.domain_sethandle xc 0 uuid)
+    with_xc (fun xc -> Xenctrl.domain_sethandle xc 0 uuid)
   )
 
 (** Perform some startup sanity checks. Note that we nolonger look for processes using 'ps':
@@ -109,17 +110,17 @@ let wait_until_database_is_ready_for_clients () =
        while not !database_ready_for_clients do Condition.wait database_ready_for_clients_c database_ready_for_clients_m done)
 
 (** Handler for the remote database access URL *)
-let remote_database_access_handler req bio = 
+let remote_database_access_handler req bio c =
 	wait_until_database_is_ready_for_clients ();
-	Db_remote_cache_access_v1.handler req bio
+	Db_remote_cache_access_v1.handler req bio c
 
 (** Handler for the remote database access URL *)
-let remote_database_access_handler_v2 req bio = 
+let remote_database_access_handler_v2 req bio c =
 	wait_until_database_is_ready_for_clients ();
-	Db_remote_cache_access_v2.handler req bio
+	Db_remote_cache_access_v2.handler req bio c
 
 (** Handler for the legacy remote stats URL *)
-let remote_stats_handler req bio = 
+let remote_stats_handler req bio _ =
   wait_until_database_is_ready_for_clients ();
 	let fd = Buf_io.fd_of bio in (* fd only used for writing *)
 
@@ -171,9 +172,11 @@ let signals_handling () =
 
 let domain0_setup () =
   with_xc_and_xs (fun xc xs ->
+    let already_setup = try ignore(xs.Xs.read "/local/domain/0/name"); true with _ -> false in
+    if not already_setup then begin
 	     (* Write an initial neutral target in for domain 0 *)
-	     let di = Xc.domain_getinfo xc 0 in
-	     let memory_actual_kib = Xc.pages_to_kib (Int64.of_nativeint di.Xc.total_memory_pages) in
+	     let di = Xenctrl.domain_getinfo xc 0 in
+	     let memory_actual_kib = Xenctrl.pages_to_kib (Int64.of_nativeint di.Xenctrl.total_memory_pages) in
 	     (* Find domain 0's UUID *)
 	     let uuid = Xapi_inventory.lookup Xapi_inventory._control_domain_uuid in
 	     (* setup xenstore domain 0 for blktap, xentop (CA-24231) *)
@@ -188,6 +191,7 @@ let domain0_setup () =
 				  t.Xst.write Xapi_globs.xe_key Xapi_globs.xe_val;
 				  t.Xst.setperms Xapi_globs.xe_key (0, Xsraw.PERM_READ, [])
 			       )
+    end
           )
 
 let random_setup () =
@@ -208,8 +212,8 @@ let register_callback_fns() =
 		Locking_helpers.Thread_state.acquired (Locking_helpers.Process("stunnel", pid)) in
 	let unset_stunnelpid task_opt pid =
 		Locking_helpers.Thread_state.released (Locking_helpers.Process("stunnel", pid)) in
-	Xmlrpcclient.Internal.set_stunnelpid_callback := Some set_stunnelpid;
-	Xmlrpcclient.Internal.unset_stunnelpid_callback := Some unset_stunnelpid;
+	Xmlrpc_client.Internal.set_stunnelpid_callback := Some set_stunnelpid;
+	Xmlrpc_client.Internal.unset_stunnelpid_callback := Some unset_stunnelpid;
     Pervasiveext.exnhook := Some (fun _ -> log_backtrace ());
     TaskHelper.init ()
 
@@ -222,7 +226,7 @@ let daemonize = ref false
 
 let show_version () = 
   List.iter (fun (x, y) -> printf "%s=%s\n" x y)
-    [ "hg_id", Version.hg_id;
+    [ "git_id", Version.git_id;
       "hostname", Version.hostname;
       "date", Version.date;
       "PRODUCT_VERSION", Version.product_version;
@@ -249,7 +253,7 @@ let init_args() =
 	       "-dummydata", Arg.Set debug_dummy_data, "populate with dummy data for demo/debugging purposes";
 	       "-version", Arg.Unit show_version, "show version of the binary"
 	     ] (fun x -> printf "Warning, ignoring unknown argument: %s" x)
-    "Citrix XenServer API server"
+    "XenAPI server"
 
 let wait_to_die() =
   (* don't call Thread.join cos this interacts strangely with OCAML runtime and stops
@@ -301,7 +305,7 @@ let on_master_restart ~__context =
     (fun () -> 
        (* Explicitly dirty all VM memory values *)
        let uuids = Vmopshelpers.with_xc 
-	 (fun xc -> List.map (fun di -> Uuid.to_string (Uuid.uuid_of_int_array di.Xc.handle)) (Xc.domain_getinfolist xc 0)) in
+	 (fun xc -> List.map (fun di -> Uuid.to_string (Uuid.uuid_of_int_array di.Xenctrl.handle)) (Xenctrl.domain_getinfolist xc 0)) in
        Rrd_shared.dirty_memory := List.fold_left (fun acc x -> Rrd_shared.StringSet.add x acc) Rrd_shared.StringSet.empty uuids;
        Rrd_shared.dirty_host_memory := true; 
        Condition.broadcast Rrd_shared.condition);
@@ -492,11 +496,11 @@ let server_run_in_emergency_mode () =
   Xapi_globs.slave_emergency_mode := true;
   (* signal the init script that it should succeed even though we're bust *)
   Helpers.touch_file !Xapi_globs.ready_file; 
-  
-  let emergency_reboot_timer = 60. +. (float_of_int (Random.int 120)) (* restart after 1--3 minute delay *) in
-  info "Will restart management software in %.1f seconds" emergency_reboot_timer;
+
+  let emergency_reboot_delay = !Xapi_globs.emergency_reboot_delay_base +. Random.float !Xapi_globs.emergency_reboot_delay_extra in
+  info "Will restart management software in %.1f seconds" emergency_reboot_delay;
   (* in emergency mode we reboot to try reconnecting every "emergency_reboot_timer" period *)
-  let (* reboot_thread *) _ = Thread.create (fun ()->Thread.delay emergency_reboot_timer; exit Xapi_globs.restart_return_code) () in	    
+  let (* reboot_thread *) _ = Thread.create (fun ()->Thread.delay emergency_reboot_delay; exit Xapi_globs.restart_return_code) () in
   wait_to_die();
   exit 0
 
@@ -548,23 +552,24 @@ let resynchronise_ha_state () =
 (*     2. No other domains have been started.                     *)
 let calculate_boot_time_host_free_memory () =
 	let ( + ) = Nativeint.add in
-	let host_info = with_xc (fun xc -> Xc.physinfo xc) in
-	let host_free_pages = host_info.Xc.free_pages in
-	let host_scrub_pages = host_info.Xc.scrub_pages in
-	let domain0_info = with_xc (fun xc -> Xc.domain_getinfo xc 0) in
-	let domain0_total_pages = domain0_info.Xc.total_memory_pages in
+	let host_info = with_xc (fun xc -> Xenctrl.physinfo xc) in
+	let host_free_pages = host_info.Xenctrl.free_pages in
+	let host_scrub_pages = host_info.Xenctrl.scrub_pages in
+	let domain0_info = with_xc (fun xc -> Xenctrl.domain_getinfo xc 0) in
+	let domain0_total_pages = domain0_info.Xenctrl.total_memory_pages in
 	let boot_time_host_free_pages =
 		host_free_pages + host_scrub_pages + domain0_total_pages in
 	let boot_time_host_free_kib =
-		Xc.pages_to_kib (Int64.of_nativeint boot_time_host_free_pages) in
+		Xenctrl.pages_to_kib (Int64.of_nativeint boot_time_host_free_pages) in
 	Memory.bytes_of_kib boot_time_host_free_kib
 
 (* Read the free memory on the host and record this in the db. This is used *)
 (* as the baseline for memory calculations in the message forwarding layer. *)
 let record_boot_time_host_free_memory () =
-	if !Xapi_globs.on_system_boot then begin
+	if not (Unixext.file_exists Xapi_globs.initial_host_free_memory_file) then begin
 		try
 			let free_memory = calculate_boot_time_host_free_memory () in
+                        Unixext.mkdir_safe (Filename.dirname Xapi_globs.initial_host_free_memory_file) 0o700;
 			Unixext.write_string_to_file
 				Xapi_globs.initial_host_free_memory_file
 				(Int64.to_string free_memory)
@@ -585,7 +590,7 @@ let check_network_reset () =
 				(* Parse reset file *)
 				let args = String.split '\n' reset_file in
 				let args = List.map (fun s -> match (String.split '=' s) with k :: [v] -> k, v | _ -> "", "") args in
-				let mAC = List.assoc "MAC" args in
+				let device = List.assoc "DEVICE" args in
 				let mode = match List.assoc "MODE" args with
 					| "static" -> `Static
 					| "dhcp" | _ -> `DHCP
@@ -603,12 +608,17 @@ let check_network_reset () =
 				
 				(* Introduce PIFs for remaining interfaces *)
 				Xapi_pif.scan ~__context ~host;
-				let pifs = Db.PIF.get_all ~__context in
 				
 				(* Introduce and configure the management PIF *)
-				let pif = List.find (fun p -> Db.PIF.get_MAC ~__context ~self:p = mAC) pifs in
-				Xapi_pif.reconfigure_ip ~__context ~self:pif ~mode ~iP ~netmask ~gateway ~dNS;
-				Xapi_host.management_reconfigure ~__context ~pif;
+				let pifs = Db.PIF.get_refs_where ~__context ~expr:(And (
+					Eq (Field "host", Literal (Ref.string_of host)),
+					Eq (Field "device", Literal device)
+				)) in
+				match pifs with
+				| [] -> error "management PIF %s not found" device
+				| pif :: _ ->
+					Xapi_pif.reconfigure_ip ~__context ~self:pif ~mode ~iP ~netmask ~gateway ~dNS;
+					Xapi_host.management_reconfigure ~__context ~pif;
 			);
 		(* Remove trigger file *)
 		Unix.unlink("/tmp/network-reset")
@@ -655,14 +665,17 @@ let master_only_http_handlers = [
 ]
 
 let common_http_handlers = [
-  ("connect_migrate", (Http_svr.FdIO Xapi_vm_migrate.handler));
+  ("get_services", (Http_svr.FdIO Xapi_services.get_handler));
+  ("post_services", (Http_svr.FdIO Xapi_services.post_handler));
+  ("put_services", (Http_svr.FdIO Xapi_services.put_handler));
   ("put_import", (Http_svr.FdIO Import.handler));
   ("put_import_metadata", (Http_svr.FdIO Import.metadata_handler));
   ("put_import_raw_vdi", (Http_svr.FdIO Import_raw_vdi.handler));
   ("get_export", (Http_svr.FdIO Export.handler));
   ("get_export_metadata", (Http_svr.FdIO Export.metadata_handler));
   ("connect_console", Http_svr.FdIO (Console.handler Console.real_proxy));
-  ("get_root", Http_svr.BufIO (Fileserver.send_file "/" (Xapi_globs.base_path ^ "/www")));
+  ("connect_console_ws", Http_svr.FdIO (Console.handler Console.ws_proxy));
+  ("get_root", Http_svr.BufIO (Fileserver.send_file "/" Fhs.webdir));
   ("post_cli", (Http_svr.BufIO Xapi_cli.handler));
   ("get_host_backup", (Http_svr.FdIO Xapi_host_backup.host_backup_handler));
   ("put_host_restore", (Http_svr.FdIO Xapi_host_backup.host_restore_handler));
@@ -691,6 +704,8 @@ let common_http_handlers = [
   ("get_audit_log", (Http_svr.BufIO Audit_log.handler));
   ("post_root", (Http_svr.BufIO (Api_server.callback false)));
   ("post_json", (Http_svr.BufIO (Api_server.callback true)));
+  ("post_root_options", (Http_svr.BufIO (Api_server.options_callback)));
+  ("post_json_options", (Http_svr.BufIO (Api_server.options_callback)));
 ]
 
 let server_init() =
@@ -699,13 +714,13 @@ let server_init() =
     Unixext.mkdir_safe (Filename.dirname Xapi_globs.unix_domain_socket) 0o700;
     Unixext.unlink_safe Xapi_globs.unix_domain_socket;
     let domain_sock = Xapi_http.bind (Unix.ADDR_UNIX(Xapi_globs.unix_domain_socket)) in
-    ignore(Http_svr.start (domain_sock, "unix-RPC"));
+    ignore(Http_svr.start Xapi_http.server domain_sock);
     in
   let listen_localhost () =
     (* Always listen on 127.0.0.1 *)
     let localhost = Unix.inet_addr_of_string "127.0.0.1" in
     let localhost_sock = Xapi_http.bind (Unix.ADDR_INET(localhost, Xapi_globs.http_port)) in
-    ignore(Http_svr.start (localhost_sock, "inet-RPC"));
+    ignore(Http_svr.start Xapi_http.server localhost_sock);
     in
 
   let print_server_starting_message() = debug "on_system_boot=%b pool_role=%s" !Xapi_globs.on_system_boot (Pool_role.string_of (Pool_role.get_role ())) in
@@ -809,7 +824,8 @@ let server_init() =
     Server_helpers.exec_with_new_task "server_init" (fun __context ->
     Startup.run ~__context [
     "Reading config file", [], (fun () -> Xapi_config.read_config !Xapi_globs.config_file);
-    "Reading log config file", [ Startup.NoExnRaising ], (fun () -> Xapi_config.read_log_config !Xapi_globs.log_config_file);
+    "Reading log config file", [ Startup.NoExnRaising ], (fun () ->Xapi_config.read_log_config !Xapi_globs.log_config_file);
+    "Reading external global variables definition", [ Startup.NoExnRaising ], Xapi_globs.read_external_config;
     "Initing stunnel path", [], Stunnel.init_stunnel_path;
     "XAPI SERVER STARTING", [], print_server_starting_message;
     "Parsing inventory file", [], Xapi_inventory.read_inventory;
@@ -824,10 +840,12 @@ let server_init() =
     "Running startup check", [], startup_check;
     "Registering SR plugins", [Startup.OnlyMaster], Sm.register;
 	"Initialising SM state", [], Storage_impl.initialise;
+	"Starting SM service", [], Storage_access.start;
     "Registering http handlers", [], (fun () -> List.iter Xapi_http.add_handler common_http_handlers);
     "Registering master-only http handlers", [ Startup.OnlyMaster ], (fun () -> List.iter Xapi_http.add_handler master_only_http_handlers);
     "Listening unix socket", [], listen_unix_socket;
     "Listening localhost", [], listen_localhost;
+    "Metadata VDI liveness monitor", [ Startup.OnlyMaster; Startup.OnThread ], (fun () -> Redo_log_alert.loop ());
     "Checking HA configuration", [], start_ha;
 	"Checking for non-HA redo-log", [], start_redo_log;
     (* It is a pre-requisite for starting db engine *)
@@ -840,8 +858,6 @@ let server_init() =
      running etc.) -- see CA-11087 *)
     "starting up database engine", [ Startup.OnlyMaster ], start_database_engine;
 	"hi-level database upgrade", [ Startup.OnlyMaster ], Xapi_db_upgrade.hi_level_db_upgrade_rules ~__context;
-    "HA metadata VDI liveness monitor", [ Startup.OnlyMaster; Startup.OnThread ], (fun () -> Redo_log_alert.loop Xapi_ha.ha_redo_log);
-    "DR metadata VDI liveness monitor", [ Startup.OnlyMaster; Startup.OnThread ], (fun () -> Xapi_vdi_helpers.metadata_replication_monitor ~__context);
     "bringing up management interface", [], bring_up_management_if ~__context;
     "Starting periodic scheduler", [Startup.OnThread], Xapi_periodic_scheduler.loop;
     "Remote requests", [Startup.OnThread], Remote_requests.handle_requests;
@@ -876,14 +892,14 @@ let server_init() =
               debug "I think the error is a temporary one, retrying in 5s";
               Thread.delay 5.;
           | Some Permanent ->
-              error "Permanent error in Pool.hello, will retry after %.0fs just in case" Xapi_globs.permanent_master_failure_retry_timeout;
-              Thread.delay Xapi_globs.permanent_master_failure_retry_timeout
+              error "Permanent error in Pool.hello, will retry after %.0fs just in case" !Xapi_globs.permanent_master_failure_retry_interval;
+              Thread.delay !Xapi_globs.permanent_master_failure_retry_interval
           end;
         done;
         debug "Startup successful";
         Xapi_globs.slave_emergency_mode := false;
         Master_connection.connection_timeout := initial_connection_timeout;
-        
+
         begin
           try
             (* We can't tolerate an exception in db synchronization so fall back into emergency mode
@@ -899,7 +915,7 @@ let server_init() =
               server_run_in_emergency_mode()
             end
         end;
-        Master_connection.connection_timeout := Xapi_globs.master_connect_retry_timeout;
+        Master_connection.connection_timeout := !Xapi_globs.master_connection_retry_timeout;
         Master_connection.restart_on_connection_timeout := true;
         Master_connection.on_database_connection_established := (fun () -> on_master_restart ~__context);
     end;
@@ -937,10 +953,10 @@ let server_init() =
       "initialising storage", [ Startup.NoExnRaising ],
                 (fun () -> Helpers.call_api_functions ~__context Create_storage.create_storage_localhost);
       (* CA-13878: make sure PBD plugging has happened before attempting to reboot any VMs *)
-      "starting events thread", [], (fun () -> if not (!noevents) then ignore (Thread.create Events.listen_xal ()));
+      "listening to events from xenopsd", [], (fun () -> if not (!noevents) && (!Xapi_globs.use_xenopsd) then ignore (Thread.create Xapi_xenops.events_from_xenopsd ()));
+      "listening to events from xapi", [], (fun () -> if not (!noevents) && (!Xapi_globs.use_xenopsd) then ignore (Thread.create Xapi_xenops.events_from_xapi ()));
+
       "SR scanning", [ Startup.OnlyMaster; Startup.OnThread ], Xapi_sr.scanning_thread;
-      "checking/creating templates", [ Startup.OnlyMaster; Startup.NoExnRaising ],
-                 (fun () -> Helpers.call_api_functions ~__context Create_templates.create_all_templates);
       "writing init complete", [], (fun () -> Helpers.touch_file !Xapi_globs.init_complete);
 (*      "Synchronising HA state with Pool", [ Startup.NoExnRaising ], Xapi_ha.synchronise_ha_state_with_pool; *)
 			"Starting DR redo-logs", [ Startup.OnlyMaster; ], start_dr_redo_logs;
@@ -1115,20 +1131,86 @@ let watchdog f =
 			loginfo "Fatal: %s" !error_msg;
 			eprintf "%s\n" !error_msg;
 		end;
-		exit !exit_code    
+		exit !exit_code
     end
 
+let set_thread_queue_params () =
+	let safe_limit = 0.9 in
+	let cpu_num =
+		let s = Unixext.string_of_file "/proc/cpuinfo" in
+		max (float_of_int (List.length (String.find_all "\n\n" s))) 1. in
+	let hard_limit =
+		let stack_size_kb =
+			try
+				let ic = Unix.open_process_in "ulimit -s" in
+				let s = input_line ic in
+				ignore (Unix.close_process_in ic);
+				float_of_string s
+			with _ -> 8192. (* Conservative default *) in
+		(* At least since kernel 2.6 *)
+		let virtual_space_kb = 3 * 1024 * 1024 in
+		(float_of_int virtual_space_kb) /. stack_size_kb in
+	let soft_limit = ref 75. in
+	let confidence = ref 0.3 in
+	let tolarence = ref 1. in
+	let calm_down = ref 5. in
+	let last_update = ref (Unix.time (), Thread.Now) in
+	let wait_or_not () =
+		let current_run = float_of_int (Thread.running_threads ()) in
+		if current_run >= hard_limit *. safe_limit then Thread.Indefinite
+		else if current_run < !soft_limit *. !confidence *. !tolarence then Thread.Now
+		else
+			let last_clock, last_decision = !last_update in
+			let now = Unix.time () in
+			if now -. last_clock < !calm_down then last_decision else
+				let cpuload =
+					let upbound = (cpu_num +. 1.) *. 2. in
+					let loadavg = Helpers.loadavg () in
+					(sqrt loadavg) /. (sqrt upbound) in
+				let memload = Helpers.memusage () in
+				let load = max cpuload memload in
+				(* If load measurement gets problem then play safe *)
+				if load <= 0. then Thread.Indefinite else
+					let decision = if load < safe_limit then Thread.Now else Thread.Indefinite in
+					last_update := (now, decision);
+					let soft_limit' = current_run /. load in
+					let confidence' = if load < 1. then load else 1. /. load in
+					let new_soft_limit =
+						(soft_limit' *. confidence' +. !soft_limit *. !confidence)
+						/. (confidence' +. !confidence) in
+					let new_confidence =
+						(confidence' *. confidence' +. !confidence *. !confidence)
+						/. (confidence' +. !confidence) in
+					let new_tolarence =
+						1. -. (abs_float (confidence' -. !confidence)) in
+					let new_calm_down =
+						min 60. (max 5. (1. /. (abs_float (confidence' -. !confidence)))) in
+					soft_limit := new_soft_limit;
+					confidence := new_confidence;
+					tolarence := new_tolarence;
+					calm_down := new_calm_down;
+					debug "Set threads number soft limit to %f with %f confidence and %f \
+tolarence, the next tweak will be %f seconds away at the earliest."
+						!soft_limit !confidence !tolarence !calm_down;
+					decision in
+	Thread.set_policy (Thread.WaitCondition wait_or_not)
+
+
 let _ =
-  init_args(); (* need to read args to find out whether to daemonize or not *)
+	init_args(); (* need to read args to find out whether to daemonize or not *)
+
   if !daemonize then
     Unixext.daemonize ();
   Unixext.pidfile_write "/var/run/xapi.pid";
 
-  (* chdir to /var/xapi/debug so that's where xapi coredumps go 
+  (* chdir to @VARDIR@/debug so that's where xapi coredumps go 
      (in the unlikely event that there are any ;) *)
-  Unixext.mkdir_rec "/var/xapi/debug" 0o700;
-  Unix.chdir "/var/xapi/debug";
+  Unixext.mkdir_rec (Filename.concat Fhs.vardir "debug") 0o700;
+  Unix.chdir (Filename.concat Fhs.vardir "debug");
+
+	set_thread_queue_params ();
 
   (* WARNING! Never move this function call into the list of startup tasks. *)
   record_boot_time_host_free_memory ();
+
   watchdog server_init

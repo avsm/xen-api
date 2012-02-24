@@ -22,6 +22,7 @@ open Vmopshelpers
 open Create_misc
 open Client
 open Pervasiveext
+open Xenstore
 
 module D=Debug.Debugger(struct let name="dbsync" end)
 open D
@@ -82,7 +83,7 @@ let refresh_localhost_info ~__context info =
     Db.Host.set_API_version_major ~__context ~self:host ~value:Xapi_globs.api_version_major;
     Db.Host.set_API_version_minor ~__context ~self:host ~value:Xapi_globs.api_version_minor;
     Db.Host.set_hostname ~__context ~self:host ~value:info.hostname;
-    let caps = String.split ' ' (Xc.with_intf (fun xc -> Xc.version_capabilities xc)) in
+    let caps = String.split ' ' (Xenctrl.with_intf (fun xc -> Xenctrl.version_capabilities xc)) in
     Db.Host.set_capabilities ~__context ~self:host ~value:caps;
     Db.Host.set_address ~__context ~self:host ~value:(get_my_ip_addr());
 
@@ -108,224 +109,6 @@ let refresh_localhost_info ~__context info =
 
 (*************** update database tools ******************)
 
-(** Update the list of VMs *)
-let update_vms ~xal ~__context =
-  debug "Updating the list of VMs";
-  let xs = Xal.xs_of_ctx xal in
-  let xc = Xal.xc_of_ctx xal in
-
-  (** Reset the state of the VM, and clear current operations on VBDs and VIFs *)
-  let force_state_reset ~__context ~self ~value:state =
-    Xapi_vm_lifecycle.force_state_reset ~__context ~self ~value:state;
-    if state = `Halted 
-    then
-      begin
-	(* if we're halted then also ensure any VBDs and VIFs have their current operations reset *)
-	List.iter (fun vbd -> Xapi_vbd_helpers.clear_current_operations ~__context ~self:vbd)
-	  (Db.VM.get_VBDs ~__context ~self);
-	List.iter (fun vif -> Xapi_vif_helpers.clear_current_operations ~__context ~self:vif)
-	  (Db.VM.get_VIFs ~__context ~self)
-      end
-  in
-
-  let set_db_shutdown vm =
-    Db.VM.set_domid ~__context ~self:vm ~value:(-1L);
-    force_state_reset ~__context ~self:vm ~value:`Halted in
-
-  let set_db_state_and_domid vm state domid =
-    let domid = Int64.of_int domid in
-    Db.VM.set_domid ~__context ~self:vm ~value:domid;
-    List.iter (fun self -> Xapi_vbd_helpers.clear_current_operations ~__context ~self) (Db.VM.get_VBDs ~__context ~self:vm);
-    force_state_reset ~__context ~self:vm ~value:state in
-
-  let all_my_domains = Xc.domain_getinfolist xc 0 in
-  let my_active_domains = List.filter (fun dinfo -> (not dinfo.Xc.dying) && (not dinfo.Xc.shutdown)) all_my_domains in
-  let my_shutdown_domains = List.filter (fun dinfo -> dinfo.Xc.shutdown) all_my_domains in
-
-  let this_host = Helpers.get_localhost __context in
-  (* CA-22309: consider this host to 'own' a domain if:
-     * it is resident_on me
-     * it is scheduled_to_be_resident_on me AND NOT resident_on somewhere else: CA-29412 *)
-  let all_resident_on_vms = Db.VM.get_records_where ~__context ~expr:(Db_filter_types.Eq (Db_filter_types.Field "resident_on", Db_filter_types.Literal (Ref.string_of this_host))) in
-  let all_scheduled_to_be_resident_on_vms = Db.VM.get_records_where ~__context ~expr:(Db_filter_types.Eq (Db_filter_types.Field "scheduled_to_be_resident_on", Db_filter_types.Literal (Ref.string_of this_host))) in
-  (* Remove all the scheduled_to_be_resident_on VMs which are resident_on somewhere since that host 'owns' them.
-     NB if resident_on this host the VM will still be counted in the all_resident_on_vms set *)
-  let really_my_scheduled_to_be_resident_on_vms = 
-    List.filter (fun (_, vm_r) -> not (Db.is_valid_ref __context vm_r.API.vM_resident_on)) all_scheduled_to_be_resident_on_vms in
-  let all_vms_assigned_to_me = Listext.List.setify (all_resident_on_vms @ really_my_scheduled_to_be_resident_on_vms) in
-
-  let power_states_where_domain_exists = [ `Running; `Paused ] in
-  let my_running_vms_according_to_db =
-    List.filter (fun (_,vmrec) -> (List.mem vmrec.API.vM_power_state power_states_where_domain_exists)) all_vms_assigned_to_me in
-  let my_nonrunning_vms_according_to_db = 
-    List.filter (fun (_,vmrec) -> not (List.mem vmrec.API.vM_power_state power_states_where_domain_exists)) all_vms_assigned_to_me in
-  (* Set scheduled_to_be_resident_on and resident_on to NULL for a domain which is powered off: this avoids confusing
-     the host memory check in VM.start *)
-  List.iter (fun (r, vmrec) -> 
-	       info "Clearing VM.resident_on and current_operations for uuid '%s'" vmrec.API.vM_uuid;
-	       Db.VM.set_current_operations ~__context ~self:r ~value:[];
-	       Db.VM.set_resident_on ~__context ~self:r ~value:Ref.null;
-	       Db.VM.set_scheduled_to_be_resident_on ~__context ~self:r ~value:Ref.null;
-	    ) my_nonrunning_vms_according_to_db;
-
-  let my_running_vm_refs_according_to_db = List.map fst my_running_vms_according_to_db in
-
-  let uuid_from_dinfo dinfo =
-    Uuid.to_string (Uuid.uuid_of_int_array dinfo.Xc.handle) in
-
-  let uuid_from_vmref vmref =
-    try
-      let _,vmrec = List.find (fun (ref,_)->ref=vmref) all_vms_assigned_to_me in
-      vmrec.API.vM_uuid
-    with _ ->
-      Db.VM.get_uuid ~__context ~self:vmref in
-
-  let vmrefrec_of_dinfo dinfo =
-    let uuid = uuid_from_dinfo dinfo in
-    try
-      let vmrefrec = List.find (fun (ref,apirec)->apirec.API.vM_uuid=uuid) all_vms_assigned_to_me in
-      vmrefrec
-    with _ ->
-      let _ref = Db.VM.get_by_uuid ~__context ~uuid in
-      let _rec = Db.VM.get_record ~__context ~self:_ref in
-      (_ref,_rec)
-  in
-
-  let sync_devices dinfo =
-    let (vmref,vmrec) = vmrefrec_of_dinfo dinfo in
-    (* Pretend that an event has been triggered for each VBD.
-       Note we call the event module's inner functions synchronously, with no locks.
-       This is only safe because we haven't started the background thread monitor yet. *)
-    Locking_helpers.with_lock vmref
-      (fun token () ->
-	 let vm_vbds = vmrec.API.vM_VBDs in
-	 List.iter
-	   (fun vbd ->
-	      try
-			if Db.is_valid_ref __context vbd && not (Db.VBD.get_empty ~__context ~self:vbd)
-			then Events.Resync.vbd ~__context token vmref vbd
-	      with e ->
-		warn "Caught error resynchronising VBD: %s" (ExnHelper.string_of_exn e)) vm_vbds;
-	 let vm_vifs = vmrec.API.vM_VIFs in
-	 List.iter 
-		 (fun vif ->
-			 try
-				 if Db.is_valid_ref __context vif then begin
-					 (* Events.Resync.vif assumes that VIF is registered if currently_attached = true.
-						It will explicitly unregister it IFF currently_attached transitions to false *)
-					 if Db.VIF.get_currently_attached ~__context ~self:vif
-					 then Xapi_network.register_vif ~__context vif;
-					 Events.Resync.vif ~__context token vmref vif
-				 end
-			 with e ->
-				 warn "Caught error resynchronising VIF: %s" (ExnHelper.string_of_exn e);
-		 ) vm_vifs;
-		try Events.Resync.pci ~__context token vmref
-		with e ->
-			warn "Caught error resynchronising PCIs: %s" (ExnHelper.string_of_exn e);
-      ) () in
-
-  (* We call a domain "managed" if we have some kind of vm record for
-     it [albeit an inconsistent one]; we call a domain "unmanaged" if
-     we have no record of it at all *)
-
-  (* Deal with a VM whose resident-on fields indicates it should be running here, but no domain exists here... *)
-  let vm_in_db_for_me_but_no_domain_on_me vm =
-    debug "domain marked as running on me in db, but no active domain: %s" (uuid_from_vmref vm);
-    Db.VM.set_resident_on ~__context ~self:vm ~value:Ref.null;
-    Db.VM.set_scheduled_to_be_resident_on ~__context ~self:vm ~value:Ref.null;
-    set_db_shutdown vm in
-    
-  (* Process a "managed domain" that's active here, syncing devices and registering monitoring events *)
-  let managed_domain_running dinfo =
-    let vmref,vmrec = vmrefrec_of_dinfo dinfo in
-      (* If this domain isn't marked as running on my in the database then make it so... *)
-      if not (List.mem vmref my_running_vm_refs_according_to_db) then
-	begin
-	  debug "domain running on me, but corresponding db record doesn't have resident_on=me && powerstate=running: %s" (uuid_from_vmref vmref);
-	  Db.VM.set_resident_on ~__context ~self:vmref ~value:this_host;
-	end;
-
-    (* CA-13878: if we've restarted xapi in the middle of starting or rebooting a VM, restart
-       the VM again under the assumption that the devices haven't been attached or the memory
-       image is not built.
-       We detect the starting/rebooting VM by the fact that it is paused and has used no CPU time
-         and the power-state is not marked as Paused (this distinguishes between a VM which
-         has been started paused and left alone for a long time and a VM which is being started
-         or rebooted, which would always have the power state to Halted or Running)
-       We start it again by setting the domain's state to shutdown with reason reboot (the event
-       thread will do the hard work for us). *)
-    if dinfo.Xc.paused && not(dinfo.Xc.shutdown) && dinfo.Xc.cpu_time = 0L && 
-      (vmrec.API.vM_power_state <> `Paused) then begin
-	warn "domain id %d uuid %s is paused but not in the database as paused; assuming it's broken; rebooting" 
-	  dinfo.Xc.domid (uuid_from_vmref vmref);
-	(* Mark the domain as shutdown(reboot), the power state as running and inject
-	   a fake event into the event system. This should provoke the event thread into 
-	   restarting the VM *)
-	Xc.domain_shutdown xc dinfo.Xc.domid Xc.Reboot;
-	set_db_state_and_domid vmref `Running dinfo.Xc.domid;
-	Events.callback_release xal dinfo.Xc.domid (Uuid.string_of_uuid (Uuid.uuid_of_int_array dinfo.Xc.handle))
-      end else begin
-	(* Reset the power state, this also clears VBD operations etc *)
-	let state = if dinfo.Xc.paused then `Paused else `Running in
-	set_db_state_and_domid vmref state dinfo.Xc.domid;
-      end;
-    (* Now sync devices *)
-    debug "syncing devices and registering vm for monitoring: %s" (uuid_from_dinfo dinfo);
-    let uuid = Uuid.uuid_of_int_array dinfo.Xc.handle in
-	sync_devices dinfo;
-	(* Update the VM's guest metrics since: (i) while we were offline we may
-	   have missed an update; and (ii) if the tools .iso has been updated then
-	   we wish to re-evaluate whether we believe the VMs have up-to-date
-	   tools *)
-
-	Events.guest_agent_update xal dinfo.Xc.domid (uuid_from_dinfo dinfo);
-	(* Now register with monitoring thread *)
-
-      Monitor_rrds.load_rrd ~__context (Uuid.to_string uuid) false
-  in
-
-  (* Process a managed domain that exists here, but is in the shutdown state *)
-  let managed_domain_shutdown dinfo =
-    debug "found shutdown domain; trying to clean-up: %s" (uuid_from_dinfo dinfo);
-    let vmref,vmrec = vmrefrec_of_dinfo dinfo in
-    if vmrec.API.vM_resident_on = this_host then begin
-      debug "VM is apparently resident on this host; injecting a fake event into the event thread";
-      Events.callback_release xal dinfo.Xc.domid (Uuid.string_of_uuid (Uuid.uuid_of_int_array dinfo.Xc.handle))
-    end else begin
-      debug "VM is not resident on this host; destroying remnant of managed domain";
-      Domain.destroy ~xc ~xs dinfo.Xc.domid
-    end in
-  
-  (* Process an "unmanaged domain" that's running here *)
-  let unmanaged_domain_running dinfo =
-    debug "killing umanaged domain: %s" (uuid_from_dinfo dinfo);
-    Domain.destroy ~xc ~xs dinfo.Xc.domid (* bye-bye... *) in
-
-  let have_record_for dinfo = try let _,_ = vmrefrec_of_dinfo dinfo in true with _ -> false in
-
-  let all_my_managed_domains = List.filter have_record_for all_my_domains in
-  let my_active_managed_domains = List.filter have_record_for my_active_domains in
-  let my_shutdown_managed_domains = List.filter have_record_for my_shutdown_domains in
-  let all_my_unmanaged_domains = List.filter (fun dinfo -> not (have_record_for dinfo)) all_my_domains in
-
-  let vm_has_domain_here vmref =
-    try
-      let vmrec = List.assoc vmref all_vms_assigned_to_me in
-      let uuid = vmrec.API.vM_uuid in
-      ignore(List.find (fun dinfo -> (uuid_from_dinfo dinfo)=uuid) all_my_managed_domains);
-      true
-    with
-	Not_found -> false in
-
-  let resident_on_but_no_domain =
-    List.filter (fun x -> not (vm_has_domain_here x)) my_running_vm_refs_according_to_db in
-
-    (* Run syncing functions on the various lists we've constructed *)
-    List.iter unmanaged_domain_running all_my_unmanaged_domains;
-    List.iter vm_in_db_for_me_but_no_domain_on_me resident_on_but_no_domain;
-    List.iter managed_domain_running my_active_managed_domains;
-    List.iter managed_domain_shutdown my_shutdown_managed_domains
 
 (** Record host memory properties in database *)
 let record_host_memory_properties ~__context =
@@ -390,34 +173,6 @@ let test_uniqueness_doesnt_kill_us ~__context =
     ()
 *)
 
-(** Important in case the server restarts in the middle of a provision: potentially leaking
-    dom0 block-attached VBDs. This will remove them again. *)
-let remove_all_leaked_vbds __context =
-  let localhost = Helpers.get_localhost ~__context in
-  let vms = Db.Host.get_resident_VMs ~__context ~self:localhost in
-  let control_domains = List.filter (fun self -> Db.VM.get_is_control_domain ~__context ~self) vms in
-  (* there should only be one control domain per host *)
-  List.iter 
-    (fun control ->
-       let vbds = Db.VM.get_VBDs ~__context ~self:control in
-       let leaked = List.filter (Attach_helpers.has_vbd_leaked __context) vbds in
-       (* Attempt to unplug and destroy them if possible *)
-       Helpers.call_api_functions ~__context
-	 (fun rpc session_id ->
-	    List.iter 
-	      (Helpers.log_exn_continue "removing leaked dom0 block-attached VBD"
-		 (fun self ->
-		    let device = Db.VBD.get_device ~__context ~self in
-		    debug "Attempting to unplug dom0 block-attached VBD device %s: %s"
-		      device (Ref.string_of self);
-		    Helpers.log_exn_continue "attempting to hot-unplug block-attached VBD"
-		      (fun self -> Client.VBD.unplug rpc session_id self) self;
-		    debug "Attempting to destroy dom0 block-attached VBD device %s: %s"
-		      device (Ref.string_of self);
-		    (* try this anyway: unplug could have failed if it wasn't plugged in *)
-		    Client.VBD.destroy rpc session_id self)) leaked)
-    ) control_domains
-
 (** Make sure the PIF we're using as a management interface is marked as attached
     otherwise we might blow it away by accident *)
 (* CA-23803:
@@ -427,52 +182,19 @@ let remove_all_leaked_vbds __context =
  *)
 let resynchronise_pif_params ~__context =
 	let localhost = Helpers.get_localhost ~__context in
-	(* 1. Acquire data. We minimise round-trips not bandwidth *)
-	let networks = Db.Network.get_all_records ~__context in
-	let expr = Db_filter_types.Eq(Db_filter_types.Field "host", Db_filter_types.Literal (Ref.string_of localhost)) in
-	let pifs = Db.PIF.get_records_where ~__context ~expr in
 
-	(* 2. Inspect current system configuration *)
-	let bridges_already_up = 
-		try Xapi_pif.read_bridges_from_inventory ()
-		with Xapi_inventory.Missing_inventory_key _ -> [] in
-	debug "dom0 interfaces: [%s]" (String.concat "; " bridges_already_up);
-	let management_bridge = 
-		try [ Xapi_inventory.lookup Xapi_inventory._management_interface ]
-		with Xapi_inventory.Missing_inventory_key _ -> [] in			
-	debug "management interface: [%s]" (String.concat "; " management_bridge);
+	(* Determine all bridges that are currently up, and ask the master to sync the currently_attached
+	 * fields on all my PIFs *)
+	Helpers.call_api_functions ~__context (fun rpc session_id ->
+		let bridges = Netdev.network.Netdev.list () in
+		Client.Host.sync_pif_currently_attached rpc session_id localhost bridges
+	);
 
-	(* 3. Produce internal lookup tables *)
-	let network_to_bridge = List.map (fun (net, net_r) -> net, net_r.API.network_bridge) networks in
+	(* sync management *)
+	Xapi_pif.update_management_flags ~__context ~host:localhost;
 
-	(* PIF -> bridge option: None means "dangling PIF" *)
-	let pifs_to_bridge =
-		(* Create a list pairing each PIF with the bridge for the network 
-		   that it is on *)
-		List.map (fun (pif, pif_r) ->
-			let net = pif_r.API.pIF_network in
-			let bridge = if List.mem_assoc net network_to_bridge
-			then Some (List.assoc net network_to_bridge) else None in
-			pif, bridge) pifs in
-
-	(* 4. Perform the database resynchronisation *)
-	List.iter
-		(fun (pif, pif_r) ->
-			let all_up_bridges = management_bridge @ bridges_already_up in
-			let bridge = List.assoc pif pifs_to_bridge in
-			let currently_attached = Opt.default false (Opt.map (fun x -> List.mem x all_up_bridges) bridge) in
-			let management = Opt.default false (Opt.map (fun x -> List.mem x management_bridge) bridge) in
-			if pif_r.API.pIF_currently_attached <> currently_attached then begin
-				Db.PIF.set_currently_attached ~__context ~self:pif ~value:currently_attached;
-				debug "PIF %s currently_attached <- %b" (Ref.string_of pif) currently_attached;
-			end;
-			if pif_r.API.pIF_management <> management then begin
-				Db.PIF.set_management ~__context ~self:pif ~value:management;
-				debug "PIF %s management <- %b" (Ref.string_of pif) management;
-			end
-		) pifs;
-		(* sync MACs and MTUs *)
-		Xapi_pif.refresh_all ~__context ~host:(Helpers.get_localhost ~__context)
+	(* sync MACs and MTUs *)
+	Xapi_pif.refresh_all ~__context ~host:localhost
 
 (** Update the database to reflect current state. Called for both start of day and after
    an agent restart. *)
@@ -518,7 +240,16 @@ let update_env __context sync_keys =
 		  Monitor.set_cache_sr cache_sr_uuid
 	  with _ -> Monitor.unset_cache_sr () 
   end;
-  
+
+  begin try
+    Unix.access "/tmp/do-not-use-networkd" [Unix.F_OK];
+    Nm.use_networkd := false;
+    debug "Using interface-reconfigure to setup networking"
+  with _ ->
+    Nm.use_networkd := true;
+    debug "Using xcp-network to setup networking"
+  end;
+
   (* Load the host rrd *)
   Monitor_rrds.load_rrd ~__context (Helpers.get_localhost_uuid ()) true;
 
@@ -546,12 +277,12 @@ let update_env __context sync_keys =
 
   switched_sync Xapi_globs.sync_update_vms (fun () -> 
     debug "updating VM states";
-    with_xal (fun xal -> update_vms ~xal ~__context);
+    Xapi_xenops.initial_vm_resync ~__context;
   );
 
-  switched_sync Xapi_globs.sync_remove_leaked_vbds (fun () ->
-    debug "removing any leaked dom0 block-attached VBDs (if any)";
-    remove_all_leaked_vbds __context;
+  switched_sync Xapi_globs.sync_pbds (fun () ->
+	  debug "resynchronising host PBDs";
+	  Storage_access.resynchronise_pbds ~__context ~pbds:(Db.Host.get_PBDs ~__context ~self:localhost);
   );
 
 (*

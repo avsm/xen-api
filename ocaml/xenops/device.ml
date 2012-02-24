@@ -16,26 +16,22 @@ open Printf
 open Stringext
 open Hashtblext
 open Pervasiveext
+open Fun
 open Listext
 
 open Device_common
+open Xenstore
 
 exception Ioemu_failed of string
 exception Ioemu_failed_dying
 
-exception Pause_failed
 exception Device_shutdown
-exception Pause_token_mismatch
-exception Device_not_paused
 exception Device_not_found
 
 exception Cdrom
 
 module D = Debug.Debugger(struct let name = "xenops" end)
 open D
-
-let qemu_dm_ready_timeout = 60. *. 20. (* seconds *)
-let qemu_dm_shutdown_timeout = 60. *. 20. (* seconds *)
 
 (* keys read by vif udev script (keep in sync with api:scripts/vif) *)
 let vif_udev_keys = "promiscuous" :: (List.map (fun x -> "ethtool-" ^ x) [ "rx"; "tx"; "sg"; "tso"; "ufo"; "gso" ])
@@ -60,12 +56,18 @@ let add_device ~xs device backend_list frontend_list private_list =
 
 	debug "adding device  B%d[%s]  F%d[%s]  H[%s]" device.backend.domid backend_path device.frontend.domid frontend_path hotplug_path;
 	Xs.transaction xs (fun t ->
+		(* Sanity check: ensure the backend domain exists *)
+		let _ =
+			try
+				let (_: string) = t.Xst.read (sprintf "/local/domain/%d/vm" device.backend.domid) in
+				()
+			with Xenbus.Xb.Noent ->
+				raise (Device_backend_vanished device) in
+
 		begin try
 			ignore (t.Xst.read frontend_path);
-			if Xenbus.of_string (t.Xst.read (frontend_path ^ "/state"))
-			   <> Xenbus.Closed then
-				raise (Device_frontend_already_connected device)
-		with Xb.Noent -> () end;
+			raise (Device_frontend_already_connected device)
+		with Xenbus.Xb.Noent -> () end;
 
 		t.Xst.rm frontend_path;
 		t.Xst.rm backend_path;
@@ -124,13 +126,87 @@ let exists ~xs (x: device) =
   try
     ignore_string(xs.Xs.read backend_stub);
     true
-  with Xb.Noent -> false
+  with Xenbus.Xb.Noent -> false
 
 let assert_exists_t ~xs t (x: device) =
   let backend_stub = backend_path_of_device ~xs x in
   try
     ignore_string(t.Xst.read backend_stub)
-  with Xb.Noent -> raise Device_not_found
+  with Xenbus.Xb.Noent -> raise Device_not_found
+
+(** When hot-unplugging a device we ask nicely *)
+let clean_shutdown_async ~xs (x: device) =
+	let backend_path = backend_path_of_device ~xs x in
+	let state_path = backend_path ^ "/state" in
+	Xs.transaction xs (fun t ->
+		let online_path = backend_path ^ "/online" in
+		debug "xenstore-write %s = 0" online_path;
+		t.Xst.write online_path "0";
+		let state = try Xenbus_utils.of_string (t.Xst.read state_path) with _ -> Xenbus_utils.Closed in
+		if state <> Xenbus_utils.Closed then (
+			debug "Device.del_device setting backend to Closing";
+			t.Xst.write state_path (Xenbus_utils.string_of Xenbus_utils.Closing);
+		)
+	)
+
+let unplug_watch ~xs (x: device) =
+	let path = Hotplug.path_written_by_hotplug_scripts x in
+	Watch.map (fun () -> "") (Watch.key_to_disappear path)
+let error_watch ~xs (x: device) = Watch.value_to_appear (error_path_of_device ~xs x)
+let frontend_closed ~xs (x: device) = Watch.map (fun () -> "") (Watch.value_to_become (frontend_path_of_device ~xs x ^ "/state") (Xenbus_utils.string_of Xenbus_utils.Closed))
+
+let clean_shutdown_wait ~xs (x: device) =
+	debug "Device.Generic.clean_shutdown_wait %s" (string_of_device x);
+
+	let on_error error =
+	    debug "Device.Generic.shutdown_common: read an error: %s" error;
+	    (* CA-14804: Delete the error node contents *)
+	    safe_rm ~xs (error_path_of_device ~xs x);
+	    raise (Device_error (x, error)) in
+
+	match Watch.wait_for ~xs (Watch.any_of [
+		`Disconnected, frontend_closed ~xs x;
+		`Unplugged, unplug_watch ~xs x; 
+		`Failed, error_watch ~xs x;
+	]) with
+		| `Disconnected, _ ->
+			debug "Device.Generic.clean_shutdown: frontend changed to state 6";
+			safe_rm ~xs (frontend_path_of_device ~xs x);
+			begin match Watch.wait_for ~xs (Watch.any_of [
+				`Unplugged, unplug_watch ~xs x;
+				`Failed, error_watch ~xs x;
+			]) with
+				| `Unplugged, _ -> rm_device_state ~xs x
+				| `Failed, error -> on_error error
+			end
+		| `Unplugged, _ -> rm_device_state ~xs x
+		| `Failed, error -> on_error error
+
+let clean_shutdown ~xs (x: device) =
+	debug "Device.Generic.clean_shutdown %s" (string_of_device x);
+	clean_shutdown_async ~xs x;
+	clean_shutdown_wait ~xs x
+
+let hard_shutdown_request ~xs (x: device) =
+	debug "Device.Generic.hard_shutdown_request %s" (string_of_device x);
+
+	let backend_path = backend_path_of_device ~xs x in
+	let online_path = backend_path ^ "/online" in
+	debug "xenstore-write %s = 0" online_path;
+	xs.Xs.write online_path "0";
+
+	debug "Device.Generic.hard_shutdown about to blow away frontend";
+	let frontend_path = frontend_path_of_device ~xs x in
+	safe_rm xs frontend_path
+
+let hard_shutdown_complete ~xs (x: device) = unplug_watch ~xs x
+
+let hard_shutdown ~xs (x: device) = 
+	hard_shutdown_request ~xs x;
+	ignore(Watch.wait_for ~xs (hard_shutdown_complete ~xs x));
+	(* blow away the backend and error paths *)
+	debug "Device.Generic.hard_shutdown about to blow away backend and error paths";
+	rm_device_state ~xs x
 
 (*
 (* Assume we've told the backend to close. Watch both the error node and one other path.
@@ -145,7 +221,7 @@ let wait_for_error_or ~xs ?(timeout=Hotplug.hotplug_timeout) doc predicate other
 	let finished = ref false and error = ref None in
 	let callback watch =
 		finished := predicate ();
-		error := (try Some (xs.Xs.read errorpath) with Xb.Noent -> None);
+		error := (try Some (xs.Xs.read errorpath) with Xenbus.Xb.Noent -> None);
 		(* We return if the predicate is true of an error node has appeared *)
 		!finished || !error <> None in
 	begin try
@@ -192,51 +268,18 @@ end
 
 module Vbd = struct
 
-let major_number_table = [| 3; 22; 33; 34; 56; 57; 88; 89; 90; 91 |]
+type shutdown_mode =
+	| Classic (** no signal that backend has flushed, rely on (eg) SM vdi_deactivate for safety *)
+    | ShutdownRequest (** explicit signal that backend has flushed via "shutdown-done" *)
 
-(** Given a string device name, return the major and minor number *)
-let device_major_minor name =
-	(* This is the same algorithm xend uses: *)
-	let a = int_of_char 'a' in
-	(* Interpret as 'sda1', 'hda' etc *)
-	try
-		let number chars =
-			if chars = [] then
-				0
-			else
-			int_of_string (String.implode chars) in
-		match String.explode name with
-		| 's' :: 'd' :: ('a'..'p' as letter) :: rest ->
-			8, 16 * (int_of_char letter - a) + (number rest)
-		| 'x' :: 'v' :: 'd' :: ('a'..'p' as letter) :: rest ->
-			202, 16 * (int_of_char letter - a) + (number rest)
-		| 'h' :: 'd' :: ('a'..'t' as letter) :: rest ->
-			let n = int_of_char letter - a in
-			major_number_table.(n / 2), 64 * (n mod 2) + (number rest)
-		| _ ->
-			raise (Device_unrecognized name)
-	with _ ->
-		let file = if Filename.is_relative name then "/dev/" ^ name else name in
-		Statdev.get_major_minor file
+let read_feature_flag ~xs (x: device) flag =
+	let feature_flag_path = Printf.sprintf "/local/domain/%d/control/%s" x.backend.domid flag in
+	try ignore(xs.Xs.read feature_flag_path); true with _ -> false
 
-(** Given a major and minor number, return a device name *)
-let major_minor_to_device (major, minor) =
-	let a = int_of_char 'a' in
-	let number x = if x = 0 then "" else string_of_int x in
-	match major with
-	| 8 -> Printf.sprintf "sd%c%s" (char_of_int (minor / 16 + a)) (number (minor mod 16))
-	| 202 -> Printf.sprintf "xvd%c%s" (char_of_int (minor / 16 + a)) (number (minor mod 16))
-	| x ->
-	    (* Find the index of x in the table *)
-	    let n = snd(Array.fold_left (fun (idx, result) n -> idx + 1, if x = n then idx else result) (0, -1) major_number_table) in
-	    if n = -1 then failwith (Printf.sprintf "Couldn't determine device name for (%d, %d)" major minor)
-	    else
-	      let plus_one, minor = if minor >= 64 then 1, minor - 64 else 0, minor in
-	      Printf.sprintf "hd%c%s" (char_of_int (n * 2 + plus_one + a)) (number minor)
-
-let device_name number =
-	let major, minor = number / 256, number mod 256 in
-	major_minor_to_device (major, minor)
+let shutdown_mode_of_device ~xs (x: device) =
+	if read_feature_flag ~xs x "feature-shutdown-request"
+	then ShutdownRequest
+	else Classic
 
 type mode = ReadOnly | ReadWrite
 
@@ -288,10 +331,6 @@ let devty_of_string = function
 	| "disk"  -> Disk
 	| _       -> invalid_arg "devty_of_string"
 
-let string_of_major_minor file =
-	let major, minor = device_major_minor file in
-	sprintf "%x:%x" major minor
-
 let kind_of_physty physty =
 	match physty with
 	| Qcow -> Tap
@@ -321,49 +360,47 @@ let uses_blktap ~phystype = List.mem phystype [ Qcow; Vhd; Aio ]
 
 (** Request either a clean or hard shutdown *)
 let request_shutdown ~xs (x: device) (force: bool) =
-	let request = if force then "force" else "normal" in
+    let request = if force then "force" else "normal" in
 
-	debug "Device.Vbd.request_shutdown %s %s" (string_of_device x) request;
+    debug "Device.Vbd.request_shutdown %s %s" (string_of_device x) request;
 
-	let backend_path = backend_path_of_device ~xs x in
-	let request_path = backend_shutdown_request_path_of_device ~xs x in
-	let online_path = backend_path ^ "/online" in
+    let backend_path = backend_path_of_device ~xs x in
+    let request_path = backend_shutdown_request_path_of_device ~xs x in
+    let online_path = backend_path ^ "/online" in
 
-	(* Prevent spurious errors appearing by not writing online=0 if force *)
-	if not(force) then begin
-	  debug "xenstore-write %s = 0" online_path;
-	  xs.Xs.write online_path "0";
-	end;
-	debug "xenstore-write %s = %s" request_path request;
-	xs.Xs.write request_path request
+    (* Prevent spurious errors appearing by not writing online=0 if force *)
+    if not(force) then begin
+        debug "xenstore-write %s = 0" online_path;
+        xs.Xs.write online_path "0";
+    end;
+    debug "xenstore-write %s = %s" request_path request;
+    xs.Xs.write request_path request
 
 (** Return the event to wait for when the shutdown has completed *)
 let shutdown_done ~xs (x: device): string Watch.t = 
-	Watch.value_to_appear (backend_shutdown_done_path_of_device ~xs x)
+    Watch.value_to_appear (backend_shutdown_done_path_of_device ~xs x)
 
-let hard_shutdown_request ~xs (x: device) = request_shutdown ~xs x true
-let hard_shutdown_complete = shutdown_done
 
-let clean_shutdown ~xs (x: device) =
-	debug "Device.Vbd.clean_shutdown %s" (string_of_device x);
+let shutdown_request_clean_shutdown_wait ~xs (x: device) =
+    debug "Device.Vbd.clean_shutdown_wait %s" (string_of_device x);
 
-	request_shutdown ~xs x false; (* normal *)
-	(* Allow the domain to reject the request by writing to the error node *)
-	let shutdown_done = shutdown_done ~xs x in
-	let error = Watch.value_to_appear (error_path_of_device ~xs x) in
-	match Watch.wait_for ~xs (Watch.any_of [ `OK, shutdown_done; `Failed, error ]) with
-	| `OK, _ ->
-	    debug "Device.Vbd.shutdown_common: shutdown-done appeared";
-	    (* Delete the trees (otherwise attempting to plug the device in again doesn't
-	       work.) This also clears any stale error nodes. *)
-	    Generic.rm_device_state ~xs x
-	| `Failed, error ->
-	    (* CA-14804: Delete the error node contents *)
-	    Generic.safe_rm ~xs (error_path_of_device ~xs x);
-	    debug "Device.Vbd.shutdown_common: read an error: %s" error;
-	    raise (Device_error (x, error))
+    (* Allow the domain to reject the request by writing to the error node *)
+    let shutdown_done = shutdown_done ~xs x in
+    let error = Watch.value_to_appear (error_path_of_device ~xs x) in
+    match Watch.wait_for ~xs (Watch.any_of [ `OK, shutdown_done; `Failed, error ]) with
+		| `OK, _ ->
+			debug "Device.Vbd.shutdown_common: shutdown-done appeared";
+			(* Delete the trees (otherwise attempting to plug the device in again doesn't
+               work.) This also clears any stale error nodes. *)
+			Generic.rm_device_state ~xs x
+		| `Failed, error ->
+			(* CA-14804: Delete the error node contents *)
+			Generic.safe_rm ~xs (error_path_of_device ~xs x);
+			debug "Device.Vbd.shutdown_common: read an error: %s" error;
+			raise (Device_error (x, error))
 
-let hard_shutdown ~xs (x: device) = 
+
+let shutdown_request_hard_shutdown ~xs (x: device) = 
 	debug "Device.Vbd.hard_shutdown %s" (string_of_device x);
 	request_shutdown ~xs x true; (* force *)
 
@@ -372,6 +409,30 @@ let hard_shutdown ~xs (x: device) =
 	Generic.rm_device_state ~xs x;
 
 	debug "Device.Vbd.hard_shutdown complete"
+
+let clean_shutdown_async ~xs x = match shutdown_mode_of_device ~xs x with
+	| Classic -> Generic.clean_shutdown_async ~xs x
+	| ShutdownRequest -> request_shutdown ~xs x false (* normal *)
+
+let clean_shutdown_wait ~xs x = match shutdown_mode_of_device ~xs x with
+	| Classic -> Generic.clean_shutdown_wait ~xs x
+	| ShutdownRequest -> shutdown_request_clean_shutdown_wait ~xs x
+
+let clean_shutdown ~xs x =
+	clean_shutdown_async ~xs x;
+	clean_shutdown_wait ~xs x
+
+let hard_shutdown ~xs x = match shutdown_mode_of_device ~xs x with
+	| Classic -> Generic.hard_shutdown ~xs x
+	| ShutdownRequest -> shutdown_request_hard_shutdown ~xs x
+
+let hard_shutdown_request ~xs x = match shutdown_mode_of_device ~xs x with
+	| Classic -> Generic.hard_shutdown_request ~xs x
+	| ShutdownRequest -> request_shutdown ~xs x true
+
+let hard_shutdown_complete ~xs x = match shutdown_mode_of_device ~xs x with
+	| Classic -> Generic.hard_shutdown_complete ~xs x
+	| ShutdownRequest -> shutdown_done ~xs x
 
 let release ~xs (x: device) =
 	debug "Device.Vbd.release %s" (string_of_device x);
@@ -383,118 +444,45 @@ let release ~xs (x: device) =
 	 * to unplug as well as the backend. CA-13506 *)
 	if x.frontend.domid = 0 then Hotplug.wait_for_frontend_unplug ~xs x
 
-let pause ~xs (x: device) = 
-	debug "Device.Vbd.pause %s" (string_of_device x);
-	let request_path = backend_pause_request_path_of_device ~xs x in
-	let token_path = backend_pause_token_path_of_device ~xs x in
-	let response_path = backend_pause_done_path_of_device ~xs x in
-	let backend_path = backend_path_of_device ~xs x in
+let free_device ~xs bus_type domid =
+	let disks = List.map
+		(fun x -> x.frontend.devid
+		|> Device_number.of_xenstore_key
+		|> Device_number.spec
+		|> (fun (_, disk, _) -> disk))
+		(Device_common.list_frontends ~xs domid) in
+	let next = List.fold_left max 0 disks + 1 in
+	bus_type, next, 0
 
-	(* Returned to the client to make sure that 'unpause' never matches the wrong 'pause' *)
-	let token = Uuid.string_of_uuid (Uuid.make_uuid ()) in
+type t = {
+	mode:mode;
+	device_number: Device_number.t option;
+	phystype: physty;
+	params: string;
+	dev_type: devty;
+	unpluggable: bool;
+	protocol: protocol option;
+	extra_backend_keys: (string * string) list;
+	extra_private_keys: (string * string) list;
+	backend_domid: int;
+}
 
-	(* Write the pause request in a transaction where we make sure the backend device
-	   directory still exists, to avoid us racing with an 'rm' and creating an orphaned key *)
-	Xs.transaction xs (fun t ->
-		(* Device should exist *)
-		Generic.assert_exists_t ~xs t x;
-
-		let path_should_not_exist path = 
-			try 
-				ignore(t.Xst.read path);
-				error "Vbd.pause failed because path exists already: %s" path;
-				raise Pause_failed
-			with Xb.Noent -> () in
-		path_should_not_exist request_path;
-		path_should_not_exist token_path;
-		path_should_not_exist response_path;
-		t.Xst.write request_path "";
-		t.Xst.write token_path token;
-	);
-
-	(* We wait either for the pause-done signal or the pause-request node being destroyed: if the pause-request
-	   node is destroyed then we assume the domain is dead and is being reaped and return an error *)
-	match Watch.wait_for ~xs (Watch.any_of [ 
-				    `OK, Watch.value_to_appear response_path; (* pause-done *)
-				    `Destroyed, Watch.map (fun () -> "") (Watch.key_to_disappear backend_path); (* backend has been deleted *) 
-				    `Shutdown, shutdown_done ~xs x; (* device has shutdown *) ]) with
-	| `OK, _ ->
-	    debug "Device.Vbd.pause %s complete" (string_of_device x);
-	    token
-	| `Destroyed, _ ->
-	    debug "Device.Vbd.pause %s failed: backend has been deleted" (string_of_device x);
-	    raise Device_shutdown
-	| `Shutdown, _ ->
-	    error "Device.Vbd.pause %s failed: backend has shutdown" (string_of_device x);
-	    raise Device_shutdown
-  
-let unpause ~xs (x: device) (token: string) = 
-	debug "Device.Vbd.unpause %s token=%s" (string_of_device x) token;
-
-	let request_path = backend_pause_request_path_of_device ~xs x in
-	let token_path = backend_pause_token_path_of_device ~xs x in
-	let response_path = backend_pause_done_path_of_device ~xs x in
-	let backend_path = backend_path_of_device ~xs x in
-	(* Both request and response should exist *)
-
-	(* Use a transaction so we can tell whether the failure is because the device doesn't exist or whether
-	   it is not paused. *)
-	let fast_track_success = Xs.transaction xs (fun t ->
-		(* Device should exist *)
-		Generic.assert_exists_t ~xs t x;
-
-		let path_should_exist path = 
-			try ignore(t.Xst.read path)
-			with Xb.Noent ->
-				error "Vbd.unpause failed because path does not exist already: %s" path;
-				raise Device_not_paused in
-		path_should_exist request_path;
-		path_should_exist token_path;
-		path_should_exist response_path;
-
-		(* Only write the xenstore if the token matches, otherwise we might unpause someone else's
-		   pause (say after a force-shutdown). If the token doesn't match then we say this unpause
-		   succeeded but someone else re-paused the device so they must call unpause themselves. *)
-		let token' = t.Xst.read token_path in
-		token <> token' (* fast track success *)
-		|| (t.Xst.rm request_path; t.Xst.rm token_path; false)
-	) in
-	if fast_track_success
-	then raise Pause_token_mismatch
-	else begin
-	  let shutdown_done = Watch.map (fun _ -> ()) (shutdown_done ~xs x) in
-	  match Watch.wait_for ~xs (Watch.any_of [ 
-				      `OK, Watch.key_to_disappear response_path; (* pause-done *)
-				      `Destroyed, Watch.key_to_disappear backend_path; (* backend has been deleted *)
-				      `Shutdown, shutdown_done; (* device has shutdown *) ]) with
-	  | `OK, _ ->
-	      debug "Device.Vbd.unpause %s complete" (string_of_device x)
-	  | `Destroyed, _ ->
-	      (* We consider this to be 'unpaused' *)
-	      debug "Device.Vbd.unpause %s: backend has been deleted, considering it 'unpaused'" (string_of_device x)
-	  | `Shutdown, _ ->
-	      (* We consider this to be 'unpaused' *)
-	      debug "Device.Vbd.unpause %s: device has shut itself down, considering it 'unpaused'" (string_of_device x);
-	end
-
-let is_paused ~xs (x: device) = 
-	let request_path = backend_pause_request_path_of_device ~xs x in
-	try ignore(xs.Xs.read request_path); true with Xb.Noent -> false
-
-(* Add the VBD to the domain, When this command returns, the device is ready. (This isn't as
-   concurrent as xend-- xend allocates loopdevices via hotplug in parallel and then
-   performs a 'waitForDevices') *)
-let add ~xs ~hvm ~mode ~device_number ~phystype ~physpath ~dev_type ~unpluggable
-        ?(protocol=Protocol_Native) ?extra_backend_keys ?(extra_private_keys=[]) ?(backend_domid=0) domid  =
+let add_async ~xs ~hvm x domid =
 	let back_tbl = Hashtbl.create 16 and front_tbl = Hashtbl.create 16 in
-	let devid = Device_number.to_xenstore_key device_number in
+	let open Device_number in
+	(* If no device number is provided then autodetect a free one *)
+	let device_number = match x.device_number with
+		| Some x -> x
+		| None ->
+			make (free_device ~xs (if hvm then Ide else Xen) domid) in
+	let devid = to_xenstore_key device_number in
 	let device = 
-	  let backend = { domid = backend_domid; kind = Vbd; devid = devid } 
+	  let backend = { domid = x.backend_domid; kind = Vbd; devid = devid } 
 	  in  device_of_backend backend domid
 	in
 
-	debug "Device.Vbd.add (device_number=%s | physpath=%s | phystype=%s)"
-	  (Device_number.to_debug_string device_number) physpath (string_of_physty phystype);
+	debug "Device.Vbd.add (device_number=%s | params=%s | phystype=%s)"
+	  (to_debug_string device_number) x.params (string_of_physty x.phystype);
 	(* Notes:
 	   1. qemu accesses devices images itself and so needs the path of the original
               file (in params)
@@ -504,46 +492,47 @@ let add ~xs ~hvm ~mode ~device_number ~phystype ~physpath ~dev_type ~unpluggable
 	   4. in the future an HVM guest might support a mixture of both
 	*)
 
-	(match extra_backend_keys with
-	 | Some keys ->
-	     List.iter (fun (k, v) -> Hashtbl.add back_tbl k v) keys
-	 | None -> ());
-
+	List.iter (fun (k, v) -> Hashtbl.add back_tbl k v) x.extra_backend_keys;
 
 	Hashtbl.add_list front_tbl [
-		"backend-id", string_of_int backend_domid;
-		"state", string_of_int (Xenbus.int_of Xenbus.Initialising);
+		"backend-id", string_of_int x.backend_domid;
+		"state", string_of_int (Xenbus_utils.int_of Xenbus_utils.Initialising);
 		"virtual-device", string_of_int devid;
-		"device-type", if dev_type = CDROM then "cdrom" else "disk";
+		"device-type", if x.dev_type = CDROM then "cdrom" else "disk";
 	];
 	Hashtbl.add_list back_tbl [
-		"physical-device", (string_of_major_minor physpath);
 		"frontend-id", sprintf "%u" domid;
 		(* Prevents the backend hotplug scripts from running if the frontend disconnects.
 		   This allows the xenbus connection to re-establish itself *)
 		"online", "1";
-		"removable", if unpluggable then "1" else "0";
-		"state", string_of_int (Xenbus.int_of Xenbus.Initialising);
-		"dev", Device_number.to_linux_device device_number;
-		"type", backendty_of_physty phystype;
-		"mode", string_of_mode mode;
-		"params", physpath;
+		"removable", if x.unpluggable then "1" else "0";
+		"state", string_of_int (Xenbus_utils.int_of Xenbus_utils.Initialising);
+		"dev", to_linux_device device_number;
+		"type", backendty_of_physty x.phystype;
+		"mode", string_of_mode x.mode;
+		"params", x.params;
 	];
-	if protocol <> Protocol_Native then
-		Hashtbl.add front_tbl "protocol" (string_of_protocol protocol);
+    (* We don't have PV drivers for HVM guests for CDROMs. We prevent
+       blkback from successfully opening the device since this can
+       prevent qemu CD eject (and subsequent vdi_deactivate) *)
+	if hvm && (x.dev_type = CDROM) then
+		Hashtbl.add back_tbl "no-physical-device" "";
 
-	if hvm && dev_type = CDROM then
-	  (* CA-50383: Don't place physical-device in the HVM CDROM
- 	     case, to prevent blkback from pinning the device node. A
- 	     Vbd.media_eject will only make qemu close it again. *)
-	  Hashtbl.remove back_tbl "physical-device";
+	Opt.iter
+		(fun protocol ->
+			Hashtbl.add front_tbl "protocol" (string_of_protocol protocol)
+		) x.protocol;
 
 	let back = Hashtbl.to_list back_tbl in
 	let front = Hashtbl.to_list front_tbl in
 
 
-	Generic.add_device ~xs device back front extra_private_keys;
+	Generic.add_device ~xs device back front x.extra_private_keys;
+	device
+
+let add_wait ~xs device =
 	Hotplug.wait_for_plug ~xs device;
+	debug "Device.Vbd successfully added; device_is_online = %b" (Hotplug.device_is_online ~xs device);
 	(* 'Normally' we connect devices to other domains, and cannot know whether the
 	   device is 'available' from their userspace (or even if they have a userspace).
 	   The best we can do is just to wait for the backend hotplug scripts to run,
@@ -553,7 +542,7 @@ let add ~xs ~hvm ~mode ~device_number ~phystype ~physpath ~dev_type ~unpluggable
 	   to wait for this condition to make the template installers work.
 	   NB if the custom hotplug script fires this implies that the xenbus state
 	   reached "connected", so we don't have to check for that first. *)
-	if domid = 0 then begin
+	if device.frontend.domid = 0 then begin
 	  try
 	    (* CA-15605: clean up on dom0 block-attach failure *)
 	    Hotplug.wait_for_frontend_plug ~xs device;
@@ -561,23 +550,26 @@ let add ~xs ~hvm ~mode ~device_number ~phystype ~physpath ~dev_type ~unpluggable
 	    debug "Caught Frontend_device_error: assuming it is safe to shutdown the backend";
 	    clean_shutdown ~xs device; (* assumes double-failure isn't possible *)
 	    release ~xs device;
-		(* Attempt to diagnose the error: the error from blkback ("2 creating vbd structure")
-		   doesn't give much away. *)
-		if phystype = Phys then begin
-		  try
-			(* Speculatively query the physical device as if a CDROM *)
-			  match Cdrom.query_cdrom_drive_status physpath with
-			  | Cdrom.DISC_OK -> () (* nothing unusual here *)
-			  | x -> 
-					error "CDROM device %s: %s" physpath (Cdrom.string_of_cdrom_drive_status x);
-					raise Cdrom
-		  with 
-		  | Cdrom as e' -> raise e'
-		  | _ -> () (* assume it wasn't a CDROM *)
-		end;
 	    raise e
 	end;
 	device
+
+(* Add the VBD to the domain, When this command returns, the device is ready. (This isn't as
+   concurrent as xend-- xend allocates loopdevices via hotplug in parallel and then
+   performs a 'waitForDevices') *)
+let add ~xs ~hvm x domid =
+	let device =
+		let result = ref None in
+		while !result = None do
+			try
+				result := Some (add_async ~xs ~hvm x domid);
+			with Device_frontend_already_connected _ as e ->
+				if x.device_number = None then begin
+					debug "Temporary failure to allocte a device number; retrying";
+					Thread.delay 0.1
+				end else raise e (* permanent failure *)
+		done; Opt.unbox !result in
+	add_wait ~xs device
 
 let qemu_media_change ~xs ~device_number domid _type params =
 	let devid = Device_number.to_xenstore_key device_number in
@@ -588,7 +580,7 @@ let qemu_media_change ~xs ~device_number domid _type params =
 		"params",         params;
 	] in
 	Xs.transaction xs (fun t -> t.Xst.writev backend back_delta);
-	debug "Media changed"
+	debug "Media changed: params = %s" params
 
 let media_tray_is_locked ~xs ~device_number domid =
 	let devid = Device_number.to_xenstore_key device_number in
@@ -602,12 +594,11 @@ let media_tray_is_locked ~xs ~device_number domid =
 let media_eject ~xs ~device_number domid =
 	qemu_media_change ~xs ~device_number domid "" ""
 
-let media_insert ~xs ~device_number ~physpath ~phystype domid =
-	let _type = backendty_of_physty phystype
-	and params = physpath in
+let media_insert ~xs ~device_number ~params ~phystype domid =
+	let _type = backendty_of_physty phystype in
 	qemu_media_change ~xs ~device_number domid _type params
 
-let media_refresh ~xs ~device_number ~physpath domid =
+let media_refresh ~xs ~device_number ~params domid =
 	let devid = Device_number.to_xenstore_key device_number in
 	let back_dom_path = xs.Xs.getdomainpath 0 in
 	let backend = sprintf "%s/backend/vbd/%u/%d" back_dom_path domid devid in
@@ -617,10 +608,10 @@ let media_refresh ~xs ~device_number ~physpath domid =
 	   spurious '/' character at the beggining of the string.  *)
 	let oldval = try xs.Xs.read path with _ -> "" in
 	let pathtowrite =
-		if oldval = physpath then (
-			"/" ^ physpath
+		if oldval = params then (
+			"/" ^ params
 		) else
-			physpath in
+			params in
 	xs.Xs.write path pathtowrite;
 	()
 
@@ -656,6 +647,41 @@ let check_mac mac =
         with _ ->
 		raise (Invalid_Mac mac)
 
+let xensource_oui = [ 0x00; 0x16; 0x3e ]
+
+let xensource_mac () =
+        let bytes = [0x00; 0x16; 0x3e] @ (List.map Random.int [0x80; 0x100; 0x100
+]) in
+        String.concat ":" (List.map (Printf.sprintf "%02x") bytes)
+
+let make_local_mac bytes =
+	(* make sure bit 1 (local) is set and bit 0 (unicast) is clear *)
+	bytes.(0) <- ((bytes.(0) lor 0x2) land (lnot 0x1));
+	Printf.sprintf "%02x:%02x:%02x:%02x:%02x:%02x"
+		bytes.(0) bytes.(1) bytes.(2) bytes.(3) bytes.(4) bytes.(5)
+
+(* Generate a completely random local MAC *)
+let random_local_mac () =
+	make_local_mac (Array.init 6 (fun i -> Random.int 0x100))
+
+let hashchain_local_mac dev seed =
+	let hash x = Digest.string x in
+	let rec chain n f acc =
+		if n = 0 then Digest.string acc
+		else chain (n-1) f (f acc) in
+	let hashed_seed = chain (dev*2) hash seed in
+	let mac_data_1 = hashed_seed in
+	let mac_data_2 = Digest.string hashed_seed in
+	let take_byte n s = Char.code (String.get s n) in
+	make_local_mac
+      [| take_byte 0 mac_data_1;
+         take_byte 1 mac_data_1;
+         take_byte 2 mac_data_1;
+         take_byte 3 mac_data_1;
+         take_byte 1 mac_data_2;
+         take_byte 2 mac_data_2; |]
+
+
 let add ~xs ~devid ~netty ~mac ~carrier ?mtu ?(rate=None) ?(protocol=Protocol_Native) ?(backend_domid=0) ?(other_config=[]) ?(extra_private_keys=[]) domid =
 	debug "Device.Vif.add domid=%d devid=%d mac=%s carrier=%b rate=%s other_config=[%s] extra_private_keys=[%s]" domid devid mac carrier
 	      (match rate with None -> "none" | Some (a, b) -> sprintf "(%Ld,%Ld)" a b)
@@ -673,7 +699,7 @@ let add ~xs ~devid ~netty ~mac ~carrier ?mtu ?(rate=None) ?(protocol=Protocol_Na
 		match rate with
 		| None                              -> []
 		| Some (kbytes_per_s, timeslice_us) ->
-			let (^*) = Int64.mul and (^/) = Int64.div in
+			let ( ^* ) = Int64.mul and ( ^/ ) = Int64.div in
 			let timeslice_us =
 				if timeslice_us > 0L then
 					timeslice_us
@@ -692,8 +718,8 @@ let add ~xs ~devid ~netty ~mac ~carrier ?mtu ?(rate=None) ?(protocol=Protocol_Na
 	let back = [
 		"frontend-id", sprintf "%u" domid;
 		"online", "1";
-		"state", string_of_int (Xenbus.int_of Xenbus.Initialising);
-		"script", "/etc/xensource/scripts/vif";
+		"state", string_of_int (Xenbus_utils.int_of Xenbus_utils.Initialising);
+		"script", (Filename.concat Fhs.scriptsdir "vif");
 		"mac", mac;
 		"handle", string_of_int devid
 	] @ back_options in
@@ -706,7 +732,7 @@ let add ~xs ~devid ~netty ~mac ~carrier ?mtu ?(rate=None) ?(protocol=Protocol_Na
 
 	let front = [
 		"backend-id", string_of_int backend_domid;
-		"state", string_of_int (Xenbus.int_of Xenbus.Initialising);
+		"state", string_of_int (Xenbus_utils.int_of Xenbus_utils.Initialising);
 		"handle", string_of_int devid;
 		"mac", mac;
 		"disconnect", if carrier then "0" else "1";
@@ -717,8 +743,8 @@ let add ~xs ~devid ~netty ~mac ~carrier ?mtu ?(rate=None) ?(protocol=Protocol_Na
 	let extra_private_keys = extra_private_keys @
 	  (match mtu with | Some mtu when mtu > 0 -> [ "MTU", string_of_int mtu ] | _ -> []) @
 	  (match netty with
-	     | Netman.Bridge b -> [ "bridge", b; "bridge-MAC", if(Xc.is_fake ()) then "fe:fe:fe:fe:fe:fe" else "fe:ff:ff:ff:ff:ff"; ]
-	     | Netman.Vswitch b -> [ "bridge", b; "bridge-MAC", if(Xc.is_fake ()) then "fe:fe:fe:fe:fe:fe" else "fe:ff:ff:ff:ff:ff"; ]
+	     | Netman.Bridge b -> [ "bridge", b; "bridge-MAC", if(Xenctrl.is_fake ()) then "fe:fe:fe:fe:fe:fe" else "fe:ff:ff:ff:ff:ff"; ]
+	     | Netman.Vswitch b -> [ "bridge", b; "bridge-MAC", if(Xenctrl.is_fake ()) then "fe:fe:fe:fe:fe:fe" else "fe:ff:ff:ff:ff:ff"; ]
 	     | Netman.DriverDomain -> []
 	     | Netman.Nat -> []) @
 	  (match rate with | None -> [] | Some(rate, timeslice) -> [ "rate", Int64.to_string rate; "timeslice", Int64.to_string timeslice ]) in
@@ -727,54 +753,9 @@ let add ~xs ~devid ~netty ~mac ~carrier ?mtu ?(rate=None) ?(protocol=Protocol_Na
 	Hotplug.wait_for_plug ~xs device;
 	device
 
-(** When hot-unplugging a device we ask nicely *)
-let request_closure ~xs (x: device) =
-	let backend_path = backend_path_of_device ~xs x in
-	let state_path = backend_path ^ "/state" in
-	Xs.transaction xs (fun t ->
-		let online_path = backend_path ^ "/online" in
-		debug "xenstore-write %s = 0" online_path;
-		t.Xst.write online_path "0";
-		let state = try Xenbus.of_string (t.Xst.read state_path) with _ -> Xenbus.Closed in
-		if state <> Xenbus.Closed then (
-			debug "Device.del_device setting backend to Closing";
-			t.Xst.write state_path (Xenbus.string_of Xenbus.Closing);
-		)
-	)
+let clean_shutdown = Generic.clean_shutdown
 
-let unplug_watch ~xs (x: device) = Watch.map (fun () -> "") (Watch.key_to_disappear (Hotplug.status_node x))
-let error_watch ~xs (x: device) = Watch.value_to_appear (error_path_of_device ~xs x) 
-
-let clean_shutdown ~xs (x: device) =
-	debug "Device.Vif.clean_shutdown %s" (string_of_device x);
-
-	request_closure ~xs x;
-	match Watch.wait_for ~xs (Watch.any_of [ `OK, unplug_watch ~xs x; `Failed, error_watch ~xs x ]) with
-	| `OK, _ ->
-	    (* Delete the trees (otherwise attempting to plug the device in again doesn't
-	       work. This also clears any stale error nodes. *)
-	    Generic.rm_device_state ~xs x
-	| `Failed, error ->
-	    debug "Device.Vif.shutdown_common: read an error: %s" error;
-	    raise (Device_error (x, error))	
-
-let hard_shutdown ~xs (x: device) =
-	debug "Device.Vif.hard_shutdown %s" (string_of_device x);
-
-	let backend_path = backend_path_of_device ~xs x in
-	let online_path = backend_path ^ "/online" in
-	debug "xenstore-write %s = 0" online_path;
-	xs.Xs.write online_path "0";
-
-	debug "Device.Vif.hard_shutdown about to blow away frontend";
-	let frontend_path = frontend_path_of_device ~xs x in
-	Generic.safe_rm xs frontend_path;
-	
-	ignore_string (Watch.wait_for ~xs (unplug_watch ~xs x));
-
-	(* blow away the backend and error paths *)
-	debug "Device.Vif.hard_shutdown about to blow away backend and error paths";
-	Generic.rm_device_state ~xs x
+let hard_shutdown = Generic.hard_shutdown
 
 let set_carrier ~xs (x: device) carrier = 
 	debug "Device.Vif.set_carrier %s <- %b" (string_of_device x) carrier;
@@ -810,13 +791,13 @@ let status ~xs ~devid domid =
 	| "online"  -> true
 	| "offline" -> false
 	| _         -> (* garbage, assuming false *) false
-	with Xb.Noent -> false
+	with Xenbus.Xb.Noent -> false
 
 end
 
 module PV_Vnc = struct
 
-let vncterm_wrapper = Xapi_globs.base_path ^ "/libexec/vncterm-wrapper"
+let vncterm_wrapper = Filename.concat Fhs.libexecdir "vncterm-wrapper"
 
 let vnc_pid_path domid = sprintf "/local/domain/%d/vncterm-pid" domid
 
@@ -886,11 +867,13 @@ let save ~xs domid =
 			  debug "Device.PV_Vnc.save: %s has appeared" filename
 	| None     -> ()
 
-let start ?statefile ~xs domid =
+let start ?statefile ~xs ?ip domid =
+	let ip = Opt.default "127.0.0.1" ip in
 	let l = [ string_of_int domid; (* absorbed by vncterm-wrapper *)
 		  (* everything else goes straight through to vncterm: *)
 		  "-x"; sprintf "/local/domain/%d/console" domid;
 		  "-T"; (* listen for raw connections *)
+		  "-v"; ip ^ ":1";
 		] @ load_args statefile in
 	(* Now add the close fds wrapper *)
 	let pid = Forkhelpers.safe_close_and_exec None None None [] vncterm_wrapper l in
@@ -928,9 +911,14 @@ let of_string x = Scanf.sscanf x "%04x:%02x:%02x.%02x" (fun a b c d -> (a, b, c,
 exception Cannot_add of dev list * exn (* devices, reason *)
 exception Cannot_use_pci_with_no_pciback of t list
 
-let get_from_system domain bus slot func =
+(* same as libxl_internal: PROC_PCI_NUM_RESOURCES *)
+let _proc_pci_num_resources = 7
+(* same as libxl_internal: PCI_BAR_IO *)
+let _pci_bar_io = 0x01L
+
+let query_pci_device domain bus slot func =
 	let map_resource file =
-		let resources = Array.create 7 (0L, 0L, 0L) in
+		let resources = Array.create _proc_pci_num_resources (0L, 0L, 0L) in
 		let i = ref 0 in
 		Unixext.readfile_line (fun line ->
 			if !i < Array.length resources then (
@@ -958,27 +946,29 @@ let get_from_system domain bus slot func =
 
 let grant_access_resources xc domid resources v =
 	let action = if v then "add" else "remove" in
-	let constant_PCI_BAR_IO = 0x01L in
 	List.iter (fun (s, e, flags) ->
-		if Int64.logand flags constant_PCI_BAR_IO = constant_PCI_BAR_IO then (
+		if Int64.logand flags _pci_bar_io = _pci_bar_io then (
 			let first_port = Int64.to_int s in
 			let nr_ports = (Int64.to_int e) - first_port + 1 in
 
 			debug "pci %s io bar %Lx-%Lx" action s e;
-			Xc.domain_ioport_permission xc domid first_port nr_ports v
+			Xenctrl.domain_ioport_permission xc domid first_port nr_ports v
 		) else (
-			let mem_to_pfn m = Int64.to_nativeint (Int64.div m 4096L) in
-			let first_pfn = mem_to_pfn s and end_pfn = mem_to_pfn e in
-			let nr_pfns = Nativeint.add (Nativeint.sub end_pfn first_pfn) 1n in
+			let size = Int64.(add (sub e s) 1L) in
+			let _page_size = 4096L in
+			let to_page_round_down m = Int64.(div m _page_size) in
+			let to_page_round_up m = Int64.(add m (sub _page_size 1L)) |> to_page_round_down in
+			let first_pfn = to_page_round_down s in
+			let nr_pfns = to_page_round_up size in
 
-			debug "pci %s mem bar %Lx-%Lx" action s e;
-			Xc.domain_iomem_permission xc domid first_pfn nr_pfns v
+			debug "pci %s mem bar first_pfn=%Lx nr_pfns=%Lx" action first_pfn nr_pfns;
+			Xenctrl.domain_iomem_permission xc domid (Int64.to_nativeint first_pfn) (Int64.to_nativeint nr_pfns) v
 		)
 	) resources
 
 let add_noexn ~xc ~xs ~hvm ~msitranslate ~pci_power_mgmt ?(flrscript=None) pcidevs domid devid =
 	let pcidevs = List.map (fun (domain, bus, slot, func) ->
-		let (irq, resources, driver) = get_from_system domain bus slot func in
+		let (irq, resources, driver) = query_pci_device domain bus slot func in
 		{ domain = domain; bus = bus; slot = slot; func = func;
 		  irq = irq; resources = resources; driver = driver }
 	) pcidevs in
@@ -989,13 +979,21 @@ let add_noexn ~xc ~xs ~hvm ~msitranslate ~pci_power_mgmt ?(flrscript=None) pcide
 	);
 
 	List.iter (fun dev ->
+		let d = to_string (dev.domain, dev.bus, dev.slot, dev.func) in
+		debug "Preparing PCI device %s" d;
+		List.iter (fun (s, e, flags) ->
+			debug "PCI device %s has resource %Lx -> %Lx (%Lx%s)" d s e flags
+				(if Int64.logand flags _pci_bar_io = _pci_bar_io then " = PCI_BAR" else "");
+		) dev.resources;
+		debug "PCI device %s has IRQ %d" d dev.irq;
 		if hvm then (
-			ignore_bool (Xc.domain_test_assign_device xc domid (dev.domain, dev.bus, dev.slot, dev.func));
+			ignore_bool (Xenctrl.domain_test_assign_device xc domid (dev.domain, dev.bus, dev.slot, dev.func));
 			()
 		);
 		grant_access_resources xc domid dev.resources true;
+		(* XXX: libxl calls xc_physdev_map_pirq *)
 		if dev.irq > 0 then
-			Xc.domain_irq_permission xc domid dev.irq true
+			Xenctrl.domain_irq_permission xc domid dev.irq true
 	) pcidevs;
 
 	let device = {
@@ -1005,31 +1003,104 @@ let add_noexn ~xc ~xs ~hvm ~msitranslate ~pci_power_mgmt ?(flrscript=None) pcide
 
 	let others = (match flrscript with None -> [] | Some script -> [ ("script", script) ]) in
 	let xsdevs = List.mapi (fun i dev ->
-		sprintf "dev-%d" i, to_string (dev.domain, dev.bus, dev.slot, dev.func);
-	) pcidevs in
+		[
+			sprintf "key-%d" i, to_string (dev.domain, dev.bus, dev.slot, dev.func);
+			sprintf "dev-%d" i, to_string (dev.domain, dev.bus, dev.slot, dev.func);
+			sprintf "opts-%d" i, "msitranslate=0,power_mgmt=0";
+			sprintf "state-%d" i, "1";
+		]
+	) pcidevs |> List.concat in
 
 	let backendlist = [
 		"frontend-id", sprintf "%u" domid;
 		"online", "1";
-		"num_devs", string_of_int (List.length xsdevs);
-		"state", string_of_int (Xenbus.int_of Xenbus.Initialising);
-		"msitranslate", string_of_int (msitranslate);
-                "pci_power_mgmt", string_of_int (pci_power_mgmt);
+		"num_devs", string_of_int (List.length pcidevs);
+		"state", string_of_int (Xenbus_utils.int_of Xenbus_utils.Initialising);
 	] and frontendlist = [
 		"backend-id", "0";
-		"state", string_of_int (Xenbus.int_of Xenbus.Initialising);
+		"state", string_of_int (Xenbus_utils.int_of Xenbus_utils.Initialising);
 	] in
+
 	Generic.add_device ~xs device (others @ xsdevs @ backendlist) frontendlist [];
 	()
 
+let pci_info_of ~msitranslate ~pci_power_mgmt = function
+    | domain, bus, dev, func ->
+        {
+            (* XXX: I don't think we can guarantee how the C compiler will
+               lay out bitfields.
+			   unsigned int reserved1:2;
+			   unsigned int reg:6;
+			   unsigned int func:3;
+			   unsigned int dev:5;
+			   unsigned int bus:8;
+			   unsigned int reserved2:7;
+			   unsigned int enable:1;
+            *)
+            Xenlight.v = (func lsl 8) lor (dev lsl 11) lor (bus lsl 16);
+            domain = domain;
+            vdevfn = 0;
+            msitranslate = msitranslate = 1;
+            power_mgmt = pci_power_mgmt = 1;
+        }
+
+
+(* XXX: this will crash because of the logging policy within the
+   Xenlight ocaml bindings.
+let add_libxl ~msitranslate ~pci_power_mgmt pcidevs domid =
+	List.iter
+		(fun dev ->
+			try
+				Xenlight.pci_add (pci_info_of ~msitranslate ~pci_power_mgmt dev) domid
+			with e ->
+				debug "Xenlight.pci_add: %s" (Printexc.to_string e);
+				raise e
+		) pcidevs
+*)
+(* XXX: this will crash because of the logging policy within the
+   Xenlight ocaml bindings.
+let release_libxl ~msitranslate ~pci_power_mgmt pcidevs domid =
+	List.iter
+		(fun dev ->
+			try
+				Xenlight.pci_remove (pci_info_of ~msitranslate ~pci_power_mgmt dev) domid
+			with e ->
+				debug "Xenlight.pci_remove: %s" (Printexc.to_string e);
+				raise e
+		) pcidevs
+*)
+(* XXX: we don't want to use the 'xl' command here because the "interface"
+   isn't considered as stable as the C API *)
+let xl_pci cmd ?(msitranslate=0) ?(pci_power_mgmt=0) pcidevs domid =
+	List.iter
+		(fun dev ->
+			try
+				let (_, _) = Forkhelpers.execute_command_get_output
+					"/usr/sbin/xl"
+					[ cmd; string_of_int domid; to_string dev ] in
+				()
+			with e ->
+				debug "xl %s: %s" cmd (Printexc.to_string e);
+				raise e
+		) pcidevs
+
+let add_xl = xl_pci "pci-attach"
+
+let release_xl = xl_pci "pci-detach"
+
 let add ~xc ~xs ~hvm ~msitranslate ~pci_power_mgmt ?flrscript pcidevs domid devid =
-	try add_noexn ~xc ~xs ~hvm ~msitranslate ~pci_power_mgmt ?flrscript pcidevs domid devid
+	try
+		if hvm
+		then add_noexn ~xc ~xs ~hvm ~msitranslate ~pci_power_mgmt ?flrscript pcidevs domid devid
+		else
+			(* Switch the PV path over to libxl since the code is better *)
+			add_xl ~msitranslate ~pci_power_mgmt pcidevs domid
 	with exn ->
 		raise (Cannot_add (pcidevs, exn))
 
-let release ~xc ~xs ~hvm pcidevs domid devid =
+let release_exn ~xc ~xs ~hvm pcidevs domid devid =
 	let pcidevs = List.map (fun (domain, bus, slot, func) ->
-		let (irq, resources, driver) = get_from_system domain bus slot func in
+		let (irq, resources, driver) = query_pci_device domain bus slot func in
 		{ domain = domain; bus = bus; slot = slot; func = func;
 		  irq = irq; resources = resources; driver = driver }
 	) pcidevs in
@@ -1042,28 +1113,34 @@ let release ~xc ~xs ~hvm pcidevs domid devid =
 	List.iter (fun dev ->
 		grant_access_resources xc domid dev.resources false;
 		if dev.irq > 0 then
-			Xc.domain_irq_permission xc domid dev.irq false
+			Xenctrl.domain_irq_permission xc domid dev.irq false
 	) pcidevs;
 	()
+
+let release ~xc ~xs ~hvm pcidevs domid devid =
+	if hvm
+	then release_exn ~xc ~xs ~hvm pcidevs domid devid
+	else 
+		(* Switch the PV path over to libxl since the code is better *)
+		release_xl pcidevs domid
 
 let write_string_to_file file s =
 	let fn_write_string fd = Unixext.really_write fd s 0 (String.length s) in
 	Unixext.with_file file [ Unix.O_WRONLY ] 0o640 fn_write_string
 
 let do_flr device =
-  debug "Doing FLR on pci device: %s" device;
+	debug "Doing FLR on pci device: %s" device;
 	let doflr = "/sys/bus/pci/drivers/pciback/do_flr" in
-	let script = Xapi_globs.base_path ^ "/libexec/pci-flr" in
-	let callscript =
-                let f s devstr =
-	                try ignore (Forkhelpers.execute_command_get_output script [ s; devstr; ])
-			        with _ -> ()
-			in
-			f
-		in
-        callscript "flr-pre" device;
-        ( try write_string_to_file doflr device with _ -> (); );
-        callscript "flr-post" device
+	let script = Filename.concat Fhs.libexecdir "pci-flr" in
+	let callscript s devstr =
+		if Sys.file_exists script then begin
+			try ignore (Forkhelpers.execute_command_get_output script [ s; devstr; ])
+			with _ -> ()
+		end
+	in
+	callscript "flr-pre" device;
+	( try write_string_to_file doflr device with _ -> (); );
+	callscript "flr-post" device
 
 let bind pcidevs =
 	let bind_to_pciback device =
@@ -1124,9 +1201,9 @@ let reset ~xs (x: dev) =
 let clean_shutdown ~xs (x: device) =
 	debug "Device.Pci.clean_shutdown %s" (string_of_device x);
 	let devs = enumerate_devs ~xs x in
-	Xc.with_intf (fun xc ->
+	Xenctrl.with_intf (fun xc ->
 		let hvm =
-			try (Xc.domain_getinfo xc x.frontend.domid).Xc.hvm_guest
+			try (Xenctrl.domain_getinfo xc x.frontend.domid).Xenctrl.hvm_guest
 			with _ -> false
 			in
 		try release ~xc ~xs ~hvm devs x.frontend.domid x.frontend.devid
@@ -1170,7 +1247,7 @@ let wait_device_model ~xc ~xs domid =
 let read_pcidir ~xc ~xs domid = 
   let path = device_model_pci_device_path xs 0 domid in
   let prefix = "dev-" in
-  let all = List.filter (String.startswith prefix) (try xs.Xs.directory path with Xb.Noent -> []) in
+  let all = List.filter (String.startswith prefix) (try xs.Xs.directory path with Xenbus.Xb.Noent -> []) in
   (* The values are the PCI device (domain, bus, dev, func) strings *)
   let device_number_of_string x =
     (* remove the silly prefix *)
@@ -1199,7 +1276,7 @@ let plug ~xc ~xs (domain, bus, dev, func) domid =
 	| x ->
 		failwith
 			(Printf.sprintf "Waiting for state=pci-inserted; got state=%s" x) in
-	Xc.domain_assign_device xc domid (domain, bus, dev, func)
+	Xenctrl.domain_assign_device xc domid (domain, bus, dev, func)
 
 let unplug ~xc ~xs (domain, bus, dev, func) domid = 
     let current = list ~xc ~xs domid in
@@ -1217,28 +1294,71 @@ let unplug ~xc ~xs (domain, bus, dev, func) domid =
 	in
 	(* CA-62028: tell the device to stop whatever it's doing *)
 	do_flr pci;
-	Xc.domain_deassign_device xc domid (domain, bus, dev, func)
+	Xenctrl.domain_deassign_device xc domid (domain, bus, dev, func)
 
 end
 
+module Vfs = struct
+
+let add ~xc ~xs ?(backend_domid=0) domid =
+    debug "Device.Vfs.add domid=%d" domid;
+    let frontend = { domid = domid; kind = Vfs; devid = 0 } in
+    let backend = { domid = backend_domid; kind = Vfs; devid = 0 } in
+    let _ = { backend = backend; frontend = frontend } in
+
+    let frontend_path = Printf.sprintf "/local/domain/%d/device/vfs/%d" domid 0 in
+    let backend_path = Printf.sprintf "/local/domain/%d/backend/vfs/%d" backend_domid domid in
+    let request_path = Printf.sprintf "/local/domain/%d/backend/vfs/exports/requests/%d" backend_domid domid in
+
+    (* TODO also have a backend?! *)
+    let front = [
+        "state", "ready"; (* definitely needs to be "ready" *)
+        "backend", backend_path;
+    ] in
+    Xs.transaction xs (fun t ->
+        (* Add the frontend *)
+        let perms = (domid, Xsraw.PERM_NONE, [(0, Xsraw.PERM_READ)]) in
+        t.Xst.mkdir frontend_path;
+        t.Xst.setperms frontend_path perms;
+        t.Xst.writev frontend_path front;
+
+        (* Now make the request *)
+        let perms = (domid, Xsraw.PERM_NONE, []) in
+        let request_path = Printf.sprintf "%s/%d" request_path 0 in
+        t.Xst.mkdir request_path;
+        t.Xst.setperms request_path perms;
+        t.Xst.write (request_path ^ "/frontend") frontend_path;
+    );
+	()
+
+let hard_shutdown ~xs (x: device) =
+	debug "Device.Vfs.hard_shutdown %s" (string_of_device x);
+	()
+
+let clean_shutdown ~xs (x: device) =
+	debug "Device.Vfs.clean_shutdown %s" (string_of_device x);
+	()
+end
+
+
 module Vfb = struct
 
-let add ~xc ~xs ~hvm ?(protocol=Protocol_Native) domid =
+let add ~xc ~xs ?(backend_domid=0) ?(protocol=Protocol_Native) domid =
 	debug "Device.Vfb.add %d" domid;
 
 	let frontend = { domid = domid; kind = Vfb; devid = 0 } in
-	let backend = { domid = 0; kind = Vfb; devid = 0 } in
+	let backend = { domid = backend_domid; kind = Vfb; devid = 0 } in
 	let device = { backend = backend; frontend = frontend } in
 
 	let back = [
 		"frontend-id", sprintf "%u" domid;
 		"online", "1";
-		"state", string_of_int (Xenbus.int_of Xenbus.Initialising);
+		"state", string_of_int (Xenbus_utils.int_of Xenbus_utils.Initialising);
 	] in
 	let front = [
-		"backend-id", string_of_int 0;
+		"backend-id", string_of_int backend_domid;
 		"protocol", (string_of_protocol protocol);
-		"state", string_of_int (Xenbus.int_of Xenbus.Initialising);
+		"state", string_of_int (Xenbus_utils.int_of Xenbus_utils.Initialising);
 	] in
 	Generic.add_device ~xs device back front [];
 	()
@@ -1255,22 +1375,22 @@ end
 
 module Vkbd = struct
 
-let add ~xc ~xs ~hvm ?(protocol=Protocol_Native) domid =
+let add ~xc ~xs ?(backend_domid=0) ?(protocol=Protocol_Native) domid =
 	debug "Device.Vkbd.add %d" domid;
 
 	let frontend = { domid = domid; kind = Vkbd; devid = 0 } in
-	let backend = { domid = 0; kind = Vkbd; devid = 0 } in
+	let backend = { domid = backend_domid; kind = Vkbd; devid = 0 } in
 	let device = { backend = backend; frontend = frontend } in
 
 	let back = [
 		"frontend-id", sprintf "%u" domid;
 		"online", "1";
-		"state", string_of_int (Xenbus.int_of Xenbus.Initialising);
+		"state", string_of_int (Xenbus_utils.int_of Xenbus_utils.Initialising);
 	] in
 	let front = [
-		"backend-id", string_of_int 0;
+		"backend-id", string_of_int backend_domid;
 		"protocol", (string_of_protocol protocol);
-		"state", string_of_int (Xenbus.int_of Xenbus.Initialising);
+		"state", string_of_int (Xenbus_utils.int_of Xenbus_utils.Initialising);
 	] in
 	Generic.add_device ~xs device back front []; 
 	()
@@ -1289,6 +1409,7 @@ let hard_shutdown ~xs (x: device) = match x.backend.kind with
   | Vif -> Vif.hard_shutdown ~xs x
   | Vbd | Tap -> Vbd.hard_shutdown ~xs x
   | Pci -> PCI.hard_shutdown ~xs x
+  | Vfs -> Vfs.hard_shutdown ~xs x
   | Vfb -> Vfb.hard_shutdown ~xs x
   | Vkbd -> Vkbd.hard_shutdown ~xs x
 
@@ -1296,6 +1417,7 @@ let clean_shutdown ~xs (x: device) = match x.backend.kind with
   | Vif -> Vif.clean_shutdown ~xs x
   | Vbd | Tap -> Vbd.clean_shutdown ~xs x
   | Pci -> PCI.clean_shutdown ~xs x
+  | Vfs -> Vfs.clean_shutdown ~xs x
   | Vfb -> Vfb.clean_shutdown ~xs x
   | Vkbd -> Vkbd.clean_shutdown ~xs x
 
@@ -1314,22 +1436,28 @@ let max_emulated_nics = 8 (** Should be <= the hardcoded maximum number of emula
 type disp_intf_opt =
     | Std_vga
     | Cirrus
+with rpc
 
 (* Display output / keyboard input *)
 type disp_opt =
 	| NONE
-	| VNC of disp_intf_opt * bool * int * string (* auto-allocate, port if previous false, keymap *)
+	| VNC of disp_intf_opt * string option * bool * int * string (* IP address, auto-allocate, port if previous false, keymap *)
 	| SDL of disp_intf_opt * string (* X11 display *)
 	| Passthrough of int option
 	| Intel of disp_intf_opt * int option
 
+type media = Disk | Cdrom
+let string_of_media = function Disk -> "disk" | Cdrom -> "cdrom"
+
 type info = {
 	memory: int64;
 	boot: string;
-	serial: string;
+	serial: string option;
+	monitor: string option;
 	vcpus: int;
 	usb: string list;
 	nics: (string * string * int) list;
+	disks: (int * string * media) list;
 	acpi: bool;
 	disp: disp_opt;
 	pci_emulations: string list;
@@ -1342,7 +1470,7 @@ type info = {
 	power_mgmt : int option;
 	oem_features : int option;
 	inject_sci : int option;
-	videoram : int;
+	video_mib : int;
 
 	extras: (string * string option) list;
 }
@@ -1409,7 +1537,7 @@ let xenclient_specific ~xs info domid =
       | Some device -> [ "-soundhw"; device ]
   in
 
-  ["-videoram"; string_of_int info.videoram;
+  ["-videoram"; string_of_int info.video_mib;
    "-M"; (if info.hvm then "xenfv" else "xenpv")] 
   @ sound_options
    
@@ -1437,9 +1565,42 @@ let get_state ~xs domid =
 	try Some (xs.Xs.read statepath)
 	with _ -> None
 
-(* Returns the allocated vnc port number *)
-let __start ~xs ~dmpath ~restore ?(timeout=qemu_dm_ready_timeout) info domid =
-	debug "Device.Dm.start domid=%d" domid;
+let cmdline_of_disp disp =
+	let vga_type_opts x = 
+	  match x with
+	    | Std_vga -> ["-std-vga"]
+	    | Cirrus -> []
+	in
+	let dom0_input_opts x =
+	  (maybe_with_default [] (fun i -> ["-dom0-input"; string_of_int i]) x)
+	in
+	let disp_options, wait_for_port =
+		match disp with
+		| NONE -> 
+		    ([], false)
+		| Passthrough dom0_input -> 
+		    let vga_type_opts = ["-vga-passthrough"] in
+		    let dom0_input_opts = dom0_input_opts dom0_input in
+		    (vga_type_opts @ dom0_input_opts), false		
+		| SDL (opts,x11name) ->
+		    ( [], false)
+		| VNC (disp_intf, ip_addr_opt, auto, port, keymap) ->
+			let ip_addr = Opt.default "127.0.0.1" ip_addr_opt in
+		    let vga_type_opts = vga_type_opts disp_intf in
+		    let vnc_opts = 
+		      if auto
+		      then [ "-vncunused"; "-k"; keymap; "-vnc"; ip_addr ^ ":1" ]
+		      else [ "-vnc"; ip_addr ^ ":" ^ (string_of_int port); "-k"; keymap ]
+		    in
+		    (vga_type_opts @ vnc_opts), true
+		| Intel (opt,dom0_input) -> 
+		    let vga_type_opts = vga_type_opts opt in
+		    let dom0_input_opts = dom0_input_opts dom0_input in
+		    (["-intel"] @ vga_type_opts @ dom0_input_opts), false
+	in
+	disp_options, wait_for_port
+
+let cmdline_of_info info restore domid =
 	let usb' =
 		if info.usb = [] then
 			[]
@@ -1466,70 +1627,57 @@ let __start ~xs ~dmpath ~restore ?(timeout=qemu_dm_ready_timeout) info domid =
 			) nics
 		else [["-net"; "none"]] in
 
+	let disks' = List.map (fun (index, file, media) -> [
+		"-drive"; sprintf "file=%s,if=ide,index=%d,media=%s" file index (string_of_media media)
+	]) info.disks in
+
 	let restorefile = sprintf qemu_restore_path domid in
-	let vga_type_opts x = 
-	  match x with
-	    | Std_vga -> ["-std-vga"]
-	    | Cirrus -> []
-	in
-	let dom0_input_opts x =
-	  (maybe_with_default [] (fun i -> ["-dom0-input"; string_of_int i]) x)
-	in
-	let disp_options, wait_for_port =
-		match info.disp with
-		| NONE -> 
-		    ([], false)
-		| Passthrough dom0_input -> 
-		    let vga_type_opts = ["-vga-passthrough"] in
-		    let dom0_input_opts = dom0_input_opts dom0_input in
-		    (vga_type_opts @ dom0_input_opts), false		
-		| SDL (opts,x11name) ->
-		    ( [], false)
-		| VNC (disp_intf, auto, port, keymap) ->
-		    let vga_type_opts = vga_type_opts disp_intf in
-		    let vnc_opts = 
-		      if auto
-		      then [ "-vncunused"; "-k"; keymap ]
-		      else [ "-vnc"; string_of_int port; "-k"; keymap ]
-		    in
-		    (vga_type_opts @ vnc_opts), true
-		| Intel (opt,dom0_input) -> 
-		    let vga_type_opts = vga_type_opts opt in
-		    let dom0_input_opts = dom0_input_opts dom0_input in
-		    (["-intel"] @ vga_type_opts @ dom0_input_opts), false
-	in
+	let disp_options, wait_for_port = cmdline_of_disp info.disp in
 
-	let xenclient_specific_options = xenclient_specific ~xs info domid in
+	[
+		"-d"; string_of_int domid;
+		"-m"; Int64.to_string (Int64.div info.memory 1024L);
+		"-boot"; info.boot;
+	] @ (Opt.default [] (Opt.map (fun x -> [ "-serial"; x ]) info.serial)) @ [
+		"-vcpus"; string_of_int info.vcpus;
+	] @ disp_options @ usb' @ List.concat nics' @ List.concat disks'
+	@ (if info.acpi then [ "-acpi" ] else [])
+	@ (if restore then [ "-loadvm"; restorefile ] else [])
+	@ (List.fold_left (fun l pci -> "-pciemulation" :: pci :: l) [] (List.rev info.pci_emulations))
+	@ (if info.pci_passthrough then ["-priv"] else [])
+	@ (List.fold_left (fun l (k, v) -> ("-" ^ k) :: (match v with None -> l | Some v -> v :: l)) [] info.extras)
+	@ (Opt.default [] (Opt.map (fun x -> [ "-monitor"; x ]) info.monitor))
 
-	let l = [ string_of_int domid; (* absorbed by qemu-dm-wrapper *)
-		  (* everything else goes straight through to qemu-dm: *)
-		  "-d"; string_of_int domid;
-		  "-m"; Int64.to_string (Int64.div info.memory 1024L);
-		  "-boot"; info.boot;
-		  "-serial"; info.serial;
-		  "-vcpus"; string_of_int info.vcpus; ]
-		@ disp_options @ usb' @ List.concat nics'
-	   @ (if info.acpi then [ "-acpi" ] else [])
-	   @ (if restore then [ "-loadvm"; restorefile ] else [])
-	   @ (List.fold_left (fun l pci -> "-pciemulation" :: pci :: l) [] (List.rev info.pci_emulations))
-	   @ (if info.pci_passthrough then ["-priv"] else [])
-	   @ xenclient_specific_options
-	   @ (List.fold_left (fun l (k, v) -> ("-" ^ k) :: (match v with None -> l | Some v -> v :: l)) [] info.extras)
-	   @ [ "-monitor"; "pty"; "-vnc"; "127.0.0.1:1" ]
-		in
-	(* Now add the close fds wrapper *)
-	let pid = Forkhelpers.safe_close_and_exec None None None [] ~syslog_stdout:true dmpath l in
 
-        debug "qemu-dm: should be running in the background (stdout and stderr redirected to syslog)";
+let vnconly_cmdline ~info ?(extras=[]) domid =
+    let disp_options, _ = cmdline_of_disp info.disp in
+	[
+		"-d"; string_of_int domid;
+		"-M"; "xenpv"; ] (* the stubdom is a PV guest *)
+    @ disp_options
+    @ (List.fold_left (fun l (k, v) -> ("-" ^ k) :: (match v with None -> l | Some v -> v :: l)) [] extras)
+
+let prepend_wrapper_args domid args =
+	(string_of_int domid) :: args
+
+(* Returns the allocated vnc port number *)
+let __start ~xs ~dmpath ?(timeout = !Xapi_globs.qemu_dm_ready_timeout) l domid =
+	debug "Device.Dm.start domid=%d" domid;
+
+	(* Execute qemu-dm-wrapper, forwarding stdout to the syslog, with the key "qemu-dm-<domid>" *)
+	let syslog_stdout = Forkhelpers.Syslog_WithKey (Printf.sprintf "qemu-dm-%d" domid) in
+	let pid = Forkhelpers.safe_close_and_exec None None None [] ~syslog_stdout dmpath (prepend_wrapper_args domid l) in
+
+        debug "qemu-dm: should be running in the background (stdout redirected to syslog)";
 
 	(* There are two common-cases:
 	   1. (in development) the qemu process may crash
 	   2. (in production) We know qemu is ready (and the domain may be unpaused) when
 	      device-misc/dm-ready is set in the store. See xs-xen.pq.hg:hvm-late-unpause *)
 
-    let dm_ready = xs.Xs.getdomainpath domid ^ "/device-misc/dm-ready" in
+    let dm_ready = Printf.sprintf "/local/domain/0/device-model/%d/state" domid in
 	let qemu_pid = Forkhelpers.getpid pid in
-	debug "qemu-dm: pid = %d. Waiting for device-misc/dm-ready" qemu_pid;
+	debug "qemu-dm: pid = %d. Waiting for %s" qemu_pid dm_ready;
 	(* We can't block for both a xenstore key and a process disappearing so we
 	   block for 5s at a time *)
 	begin
@@ -1537,8 +1685,10 @@ let __start ~xs ~dmpath ~restore ?(timeout=qemu_dm_ready_timeout) info domid =
 		let start = Unix.gettimeofday () in
 		while Unix.gettimeofday () -. start < timeout && not !finished do
 			try
-				ignore(Watch.wait_for ~xs ~timeout:5. (Watch.value_to_appear dm_ready));
-				finished := true
+			  let state = Watch.wait_for ~xs ~timeout:5. (Watch.value_to_appear dm_ready) in
+				if state = "running" 
+				then finished := true
+				else raise (Ioemu_failed (Printf.sprintf "qemu-dm state not running (%s)" state))
 			with Watch.Timeout _ ->
 				begin match Forkhelpers.waitpid_nohang pid with
 					| 0, Unix.WEXITED 0 -> () (* still running *)
@@ -1555,8 +1705,16 @@ let __start ~xs ~dmpath ~restore ?(timeout=qemu_dm_ready_timeout) info domid =
 	(* At this point we expect qemu to outlive us; we will never call waitpid *)	
 	Forkhelpers.dontwaitpid pid
 
-let start ~xs ~dmpath ?timeout info domid = __start ~xs ~restore:false ~dmpath ?timeout info domid
-let restore ~xs ~dmpath ?timeout info domid = __start ~xs ~restore:true ~dmpath ?timeout info domid
+let start ~xs ~dmpath ?timeout info domid =
+	let l = cmdline_of_info info false domid in
+	__start ~xs ~dmpath ?timeout l domid
+let restore ~xs ~dmpath ?timeout info domid =
+	let l = cmdline_of_info info true domid in
+	__start ~xs ~dmpath ?timeout l domid
+
+let start_vnconly ~xs ~dmpath ?timeout info domid =
+	let l = vnconly_cmdline ~info domid in
+	__start ~xs ~dmpath ?timeout l domid
 
 (* suspend/resume is a done by sending signals to qemu *)
 let suspend ~xs domid =

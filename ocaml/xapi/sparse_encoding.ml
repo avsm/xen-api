@@ -15,6 +15,9 @@
  * @group Import and Export
  *)
 
+module D=Debug.Debugger(struct let name="xapi" end)
+open D
+
 module Unmarshal = struct
 	let int64 (s, offset) = 
 		let (<<) a b = Int64.shift_left a b
@@ -77,6 +80,18 @@ module Marshal = struct
 
 end
 
+module Result = struct
+	(** Represents a final result sent on close *)
+	type t = int32
+
+	(** Writes a type t from a file descriptor *)
+	let marshal (fd: Unix.file_descr) x =
+		let t = Marshal.int32 x in
+		let n = Unix.write fd t 0 (String.length t) in
+		if n < (String.length t)
+		then failwith "short write while marshalling result code";
+end
+
 module Chunk = struct
 	(** Represents an single block of data to write *)
 	type t = {
@@ -89,13 +104,31 @@ module Chunk = struct
 		if n < len 
 		then failwith (Printf.sprintf "Short write: attempted to write %d bytes at %Ld, only wrote %d" len offset n)
 
+	let really_write_direct fd offset buf off len = 
+		let n = Unixext.Direct.write fd buf off len in
+		if n < len 
+		then failwith (Printf.sprintf "Short write: attempted to write %d bytes at %Ld, only wrote %d" len offset n)
+
+	let write_direct fd x =
+		debug "Chunk.write start=%Lx length=%d" x.start (String.length x.data);
+		let start_aligned = Int64.rem x.start 512L = 0L in
+		let length_aligned = (String.length x.data) mod 512 = 0 in
+		if not start_aligned || (not length_aligned) then begin
+			debug "UNALIGNED O_DIRECT Chunk.write start=%Lx length=%d" x.start (String.length x.data);
+			debug "data = [%s]" x.data;
+			failwith (Printf.sprintf "UNALIGNED O_DIRECT Chunk.write start=%Lx length=%d" x.start (String.length x.data));
+		end;
+		ignore(Unixext.Direct.lseek fd x.start Unix.SEEK_SET);
+		really_write_direct fd x.start x.data 0 (String.length x.data)
+
 	(** Writes a single block of data to the output device *)
-	let write fd x = 
+	let write fd x =
+		debug "Chunk.write start=%Lx length=%d" x.start (String.length x.data);
 		ignore(Unix.LargeFile.lseek fd x.start Unix.SEEK_SET);
 		really_write fd x.start x.data 0 (String.length x.data)
 
 	(** Reads a type t from a file descriptor *)
-	let unmarshal fd = 
+	let unmarshal (fd: Unix.file_descr) = 
 		let buf = String.make 12 '\000' in
 		Unixext.really_read fd buf 0 (String.length buf);
 		let stream = (buf, 0) in
@@ -106,7 +139,7 @@ module Chunk = struct
 		{ start = start; data = payload }
 
 	(** Writes a type t from a file descriptor *)
-	let marshal fd x = 
+	let marshal (fd: Unix.file_descr) x = 
 		let start' = Marshal.int64 x.start in
 		let len' = Marshal.int32 (Int32.of_int (String.length x.data)) in
 		really_write fd 0L start' 0 (String.length start');

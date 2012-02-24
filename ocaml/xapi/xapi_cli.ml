@@ -41,7 +41,7 @@ let write s string =
 let forward args s session =
 	(* Reject forwarding cli commands if the request came in from a tcp socket *)
 	if not (Context.is_unix_socket s) then raise (Api_errors.Server_error (Api_errors.host_is_slave,[Pool_role.get_master_address ()]));
-	let open Xmlrpcclient in
+	let open Xmlrpc_client in
 	let transport = SSL(SSL.make (), Pool_role.get_master_address (), !Xapi_globs.https_port) in
 	let body = 
 		let args = Opt.default [] (Opt.map (fun s -> [ Printf.sprintf "session_id=%s" (Ref.string_of s) ]) session) @ args in
@@ -96,6 +96,8 @@ let do_rpcs req s username password minimal cmd session args =
   let _ = check_required_keys cmd cspec.reqd in
   try
     let generic_rpc = Helpers.get_rpc () in
+    (* NB the request we've received is for the /cli. We need an XMLRPC request for the API *)
+    let req = Xmlrpc_client.xmlrpc ~version:"1.1" "/" in
     let rpc = generic_rpc req s in
     if do_forward
     then with_session ~local:false rpc username password session (fun sess -> forward args s (Some sess))
@@ -132,6 +134,8 @@ let do_help cmd minimal s =
   flush ();
   marshal s (Command (Exit 0))
 
+let uninteresting_cmd_postfixes = [ "help"; "-get"; "-list" ]
+
 let exec_command req cmd s session args =
 	let params = get_params cmd in
 	let minimal =
@@ -145,15 +149,18 @@ let exec_command req cmd s session args =
 	Cli_frontend.populate_cmdtable rpc Ref.null;
 	(* Log the actual CLI command to help diagnose failures like CA-25516 *)
 	let cmd_name = get_cmdname cmd in
-	if String.startswith "secret-" cmd_name
-	then
-		debug "xe %s %s" cmd_name (String.concat " " (List.map (fun (k, v) -> let v' = if k = "value" then "(omitted)" else v in k ^ "=" ^ v') params))
+	if cmd_name = "help" then do_help cmd minimal s
 	else
-		debug "xe %s %s" cmd_name (String.concat " " (List.map (fun (k, v) -> k ^ "=" ^ v) params));
-	if cmd_name = "help"
-	then do_help cmd minimal s
-	else do_rpcs req s u p minimal cmd session args
-
+		let uninteresting =
+			List.exists
+				(fun k -> String.endswith k cmd_name) uninteresting_cmd_postfixes in
+		let do_log = if uninteresting then debug else info in
+		if String.startswith "secret-" cmd_name
+		then
+			do_log "xe %s %s" cmd_name (String.concat " " (List.map (fun (k, v) -> let v' = if k = "value" then "(omitted)" else v in k ^ "=" ^ v') params))
+		else
+			do_log "xe %s %s" cmd_name (String.concat " " (List.map (fun (k, v) -> k ^ "=" ^ v) params));
+		do_rpcs req s u p minimal cmd session args
 
 let get_line str i =
   try
@@ -235,7 +242,7 @@ let exception_handler s e =
     | exc ->
 	Cli_util.server_error Api_errors.internal_error [ ExnHelper.string_of_exn exc ] s
 
-let handler (req:Http.Request.t) (bio: Buf_io.t) =
+let handler (req:Http.Request.t) (bio: Buf_io.t) _ =
   let str = Http_svr.read_body ~limit:Xapi_globs.http_limit_max_cli_size req bio in 
   let s = Buf_io.fd_of bio in
   (* Tell the client the server version *)

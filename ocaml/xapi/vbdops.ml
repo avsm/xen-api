@@ -47,7 +47,6 @@ let string_of_vbd ~__context ~vbd =
   let vdi = if r.API.vBD_empty then "empty" else try Db.VDI.get_uuid ~__context ~self:r.API.vBD_VDI with _ -> "missing" in
   name ^ ":" ^ vdi
 
-
 (* real helpers *)
 let create_vbd ~__context ~xs ~hvm ~protocol domid self =
   Xapi_xenops_errors.handle_xenops_error
@@ -69,26 +68,62 @@ let create_vbd ~__context ~xs ~hvm ~protocol domid self =
 
 	let userdevice = Db.VBD.get_userdevice ~__context ~self in
 	let device_number = translate_vbd_device self userdevice hvm in
-	Db.VBD.set_device ~__context ~self ~value:(Device_number.to_linux_device device_number);
 
 	let vdi = Db.VBD.get_VDI ~__context ~self in
 
+	let force_loopback_vbd = Helpers.force_loopback_vbd ~__context in
+
 	if empty then begin
 		if hvm then begin
-			let (_: Device_common.device) = Device.Vbd.add ~xs ~hvm ~mode ~phystype:Device.Vbd.File ~physpath:""
-				~device_number ~dev_type ~unpluggable ~protocol ~extra_private_keys:[ "ref", Ref.string_of self ] domid in
+			let vbd = {
+				Device.Vbd.mode = mode;
+				device_number = Some device_number;
+				phystype = Device.Vbd.File;
+				params = "";
+				dev_type = dev_type;
+				unpluggable = unpluggable;
+				protocol = if protocol = Device_common.Protocol_Native then None else Some protocol;
+				extra_backend_keys = [];
+				extra_private_keys = [ "ref", Ref.string_of self ];
+				backend_domid = 0
+			} in
+			let (_: Device_common.device) = Device.Vbd.add ~xs ~hvm vbd domid in
+			Db.VBD.set_device ~__context ~self ~value:(Device_number.to_linux_device device_number);
 			Db.VBD.set_currently_attached ~__context ~self ~value:true;			
 		end else info "domid: %d PV guests don't support the concept of an empty CD; skipping device" domid
+	end else if System_domains.storage_driver_domain_of_vbd ~__context ~vbd:self = Db.VBD.get_VM ~__context ~self && not force_loopback_vbd then begin
+		debug "VBD.plug of loopback VBD '%s'" (Ref.string_of self);
+		Storage_access.attach_and_activate ~__context ~vbd:self ~domid ~hvm
+			(fun params ->
+				let prefix = "/dev/" in
+				let prefix_len = String.length prefix in
+				let path = String.sub params prefix_len (String.length params - prefix_len) in
+				Db.VBD.set_device ~__context ~self ~value:path;
+				Db.VBD.set_currently_attached ~__context ~self ~value:true;
+			)
 	end else begin
 		let sr = Db.VDI.get_SR ~__context ~self:vdi in
 		let phystype = Device.Vbd.physty_of_string (Sm.sr_content_type ~__context ~sr) in
-		Storage_access.attach_and_activate ~__context ~vbd:self ~domid
-			(fun physpath ->
+		Storage_access.attach_and_activate ~__context ~vbd:self ~domid ~hvm
+			(fun params ->
+				let backend_domid = Storage_mux.domid_of_sr (Db.SR.get_uuid ~__context ~self:sr) in
 				try
 					(* The backend can put useful stuff in here on vdi_attach *)
 					let extra_backend_keys = List.map (fun (k, v) -> "sm-data/" ^ k, v) (Db.VDI.get_xenstore_data ~__context ~self:vdi) in
-					let (_: Device_common.device) = Device.Vbd.add ~xs ~hvm ~mode ~phystype ~physpath
-						~device_number ~dev_type ~unpluggable ~protocol ~extra_backend_keys ~extra_private_keys:[ "ref", Ref.string_of self ] domid in
+					let vbd = {
+						Device.Vbd.mode = mode;
+						device_number = Some device_number;
+						phystype = phystype;
+						params = params;
+						dev_type = dev_type;
+						unpluggable = unpluggable;
+						protocol = if protocol = Device_common.Protocol_Native then None else Some protocol;
+						extra_backend_keys = extra_backend_keys;
+						extra_private_keys = [ "ref", Ref.string_of self ];
+						backend_domid = backend_domid
+					} in
+					let (_: Device_common.device) = Device.Vbd.add ~xs ~hvm vbd domid in
+					Db.VBD.set_device ~__context ~self ~value:(Device_number.to_linux_device device_number);
 					Db.VBD.set_currently_attached ~__context ~self ~value:true;
 					debug "set_currently_attached to true for VBD uuid %s" (Db.VBD.get_uuid ~__context ~self)
 				with
@@ -103,70 +138,6 @@ let create_vbd ~__context ~xs ~hvm ~protocol domid self =
 			)
 	end
     )
-
-(** set vbd qos via ionicing blkback thread *)
-let set_vbd_qos_norestrictions ~__context ~self domid devid pid ty params alert_fct =
-	let do_ionice pid schedclass param =
-		let ionice = [| "ionice"; sprintf "-c%d" schedclass;
-		                sprintf "-n%d" param; sprintf "-p%d" pid |] in
-		match Unixext.spawnvp ionice.(0) ionice with
-		| Unix.WEXITED 0  -> ()
-		| Unix.WEXITED rc -> alert_fct (sprintf "ionice exit code = %d" rc)
-		| _               -> alert_fct "ionice didn't complete";
-		in
-
-	let apply_ioqos pid params =
-		let schedclass, needparam =
-			try
-				match List.assoc "sched" params with
-				| "rt" | "real-time" -> 1, true
-				| "idle"             -> 3, false
-				| _                  -> 2, true
-			with Not_found ->
-				2, true in
-
-		match needparam with
-		| false -> do_ionice pid schedclass 7
-		| true  -> (
-			let param =
-				if List.mem_assoc "class" params then
-					match List.assoc "class" params with
-					| "highest" -> Some 0
-					| "high"    -> Some 2
-					| "normal"  -> Some 4
-					| "low"     -> Some 6
-					| "lowest"  -> Some 7
-					| s         ->
-						try Some (int_of_string s) with _ -> None
-				else
-					None in
-			match param with
-			| None   -> alert_fct "this IO class need a valid parameter"
-			| Some n -> do_ionice pid schedclass n
-			)
-		in
-
-	match ty with
-	| "ionice" -> apply_ioqos pid params
-	| ""       -> ()
-	| _        -> alert_fct (sprintf "unknown type \"%s\"" ty)
-
-let set_vbd_qos ~__context ~self domid devid pid =
-	let ty = Db.VBD.get_qos_algorithm_type ~__context ~self in
-	let params = Db.VBD.get_qos_algorithm_params ~__context ~self in
-
-	let alert_fct reason =
-		let vbduuid = Db.VBD.get_uuid ~__context ~self in
-		let vm = Db.VBD.get_VM ~__context ~self in
-		let vmuuid = Db.VM.get_uuid ~__context ~self:vm in
-		warn "vbd qos failed: %s (vm=%s,vbd=%s)" reason vmuuid vbduuid;
-		(*
-		ignore (Xapi_alert.create_system ~__context ~level:`Warn ~message:Api_alerts.vbd_qos_failed
-		                                 ~params:[ "vm", vmuuid; "vbd", vbduuid; "reason", reason; ])
-		*)
-		in
-
-	set_vbd_qos_norestrictions ~__context ~self domid devid pid ty params alert_fct
 
 let eject_vbd ~__context ~self =
 	if not (Db.VBD.get_empty ~__context ~self) then (
@@ -207,7 +178,7 @@ let eject_vbd ~__context ~self =
 				let device_number = Device_number.of_string true (Db.VBD.get_device ~__context ~self:vbd) in
 				with_xs (fun xs ->
 					if Device.Vbd.media_is_ejected ~xs ~device_number domid then begin
-						Storage_access.deactivate_and_detach ~__context ~vbd ~domid;
+						Storage_access.deactivate_and_detach ~__context ~vbd ~domid ~unplug_frontends:true;
 						acc
 					end else
 						vbd :: acc

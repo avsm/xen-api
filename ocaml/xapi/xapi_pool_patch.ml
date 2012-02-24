@@ -206,7 +206,7 @@ let create_patch_record ~__context ?path patch_info =
 
 exception CannotUploadPatchToSlave
 
-let pool_patch_upload_handler (req: Request.t) s = 
+let pool_patch_upload_handler (req: Request.t) s _ =
   debug "Patch Upload Handler - Entered...";
 
   if not (Pool_role.is_master ())
@@ -273,14 +273,14 @@ let sync () =
       | Success(output, _) -> ()
 
 let patch_header_length = 8
-let skip_signature_flag = "/etc/xensource/skipsignature"
+let skip_signature_flag = Filename.concat Fhs.etcdir "skipsignature"
 
-let update_upload_pre_script = Xapi_globs.base_path ^ "/libexec/update-upload-pre"
-let update_upload_post_script = Xapi_globs.base_path ^ "/libexec/update-upload-post"
+let update_upload_pre_script = Filename.concat Fhs.libexecdir "update-upload-pre"
+let update_upload_post_script = Filename.concat Fhs.libexecdir "update-upload-post"
 
 let skip_signature_test () = Sys.file_exists skip_signature_flag
 
-let oem_patch_stream_handler (req: Request.t) s =
+let oem_patch_stream_handler (req: Request.t) s _ =
   Xapi_http.with_context "Streaming OEM update to secondary partition" req s
     (fun __context ->
       if not (on_oem ~__context)
@@ -413,7 +413,7 @@ let oem_patch_stream_handler (req: Request.t) s =
       debug "Update applied successfully!";
     )
 
-let pool_patch_download_handler (req: Request.t) s = 
+let pool_patch_download_handler (req: Request.t) s _ =
   Xapi_http.with_context "Downloading pool patch" req s
     (fun __context ->     
       if not(List.mem_assoc "uuid" req.Request.query) then begin
@@ -449,7 +449,7 @@ let get_patch_to_local ~__context ~self =
 				 Http.Get uri in 
              let length = Some (Db.Pool_patch.get_size ~__context ~self) in
              let master_address = Pool_role.get_master_address () in
-			 let open Xmlrpcclient in
+			 let open Xmlrpc_client in
 			 let transport = SSL(SSL.make ~use_stunnel_cache:true ~task_id:(Ref.string_of task) (), master_address, !Xapi_globs.https_port) in
 			 try
 				 with_transport transport

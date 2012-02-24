@@ -418,18 +418,21 @@ let vm_from_request ~__context (req: Request.t) =
       Helpers.call_api_functions 
         ~__context (fun rpc session_id -> Client.VM.get_by_uuid rpc session_id uuid) 
 
-let bool_from_request ~__context (req: Request.t) k =
+let bool_from_request ~__context (req: Request.t) default k =
 	if List.mem_assoc k req.Request.query
 	then bool_of_string (List.assoc k req.Request.query)
-	else false
+	else default
 
 let export_all_vms_from_request ~__context (req: Request.t) = 
-	bool_from_request ~__context req "all"
+	bool_from_request ~__context req false "all"
 
 let include_vhd_parents_from_request ~__context (req: Request.t) = 
-	bool_from_request ~__context req "include_vhd_parents"
+	bool_from_request ~__context req false "include_vhd_parents"
 
-let metadata_handler (req: Request.t) s = 
+let export_snapshots_from_request ~__context (req: Request.t) =
+    bool_from_request ~__context req true "export_snapshots"
+
+let metadata_handler (req: Request.t) s _ = 
 	debug "metadata_handler called";
 	req.Request.close <- true;
 
@@ -438,6 +441,7 @@ let metadata_handler (req: Request.t) s =
 		(fun __context ->
 			let include_vhd_parents = include_vhd_parents_from_request ~__context req in
 			let export_all = export_all_vms_from_request ~__context req in
+            let export_snapshots = export_snapshots_from_request ~__context req in
 
 			(* Get the VM refs. In case of exporting the metadata of a particular VM, return a singleton list containing the vm ref.  *)
 			(* In case of exporting all the VMs metadata, get all the VM records which are not default templates. *)
@@ -448,7 +452,10 @@ let metadata_handler (req: Request.t) s =
 						&& (List.mem_assoc Xapi_globs.default_template_key vm.API.vM_other_config)
 						&& ((List.assoc Xapi_globs.default_template_key vm.API.vM_other_config) = "true") in
 					let all_vms = Db.VM.get_all_records ~__context in
-					let interesting_vms = List.filter (fun (_, vm) -> not (is_default_template vm)) all_vms in
+					let interesting_vms = List.filter (fun (_, vm) ->
+						not (is_default_template vm)
+						&& (not vm.API.vM_is_control_domain)
+					) all_vms in
 					List.map fst interesting_vms
 				end else
 					[vm_from_request ~__context req]
@@ -469,13 +476,13 @@ let metadata_handler (req: Request.t) s =
 			(* lock all the VMs before exporting their metadata *)
 			List.iter (fun vm -> lock_vm ~__context ~vm ~task_id `metadata_export) vm_refs;
 			finally
- 				(fun () -> export_metadata ~with_snapshot_metadata:true ~preserve_power_state:true ~include_vhd_parents ~__context ~vms:vm_refs s)
+                (fun () -> export_metadata ~with_snapshot_metadata:export_snapshots ~preserve_power_state:true ~include_vhd_parents ~__context ~vms:vm_refs s)
  				(fun () ->
  					 List.iter (fun vm -> unlock_vm ~__context ~vm ~task_id) vm_refs;
  					 Tar.write_end s);
 		)
 
-let handler (req: Request.t) s = 
+let handler (req: Request.t) s _ =
   debug "export handler";
   req.Request.close <- true;
 

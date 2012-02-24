@@ -16,13 +16,11 @@ open Printf
 open Stringext
 
 open Device_common
+open Xenstore
 
 module D = Debug.Debugger(struct let name = "hotplug" end)
 open D
 
-(** Time we allow for the hotplug scripts to run before we assume something bad has
-    happened and abort *)
-let hotplug_timeout = 60. *. 20. (* seconds *)
 
 (** If we can't execute the losetup program (for example) *)
 exception External_command_failure of string
@@ -61,18 +59,21 @@ let get_private_data_path_of_device (x: device) =
 let get_hotplug_path (x: device) =
 	sprintf "%s/hotplug/%s/%d" (get_private_path x.frontend.domid) (string_of_kind x.backend.kind) x.backend.devid
 
-(* The path in xenstore written to by the hotplug scripts *)
-let status_node (x: device) = get_hotplug_path x ^ "/hotplug"
+let path_written_by_hotplug_scripts (x: device) = match x.backend.kind with
+	| Vif -> get_hotplug_path x ^ "/hotplug"
+	| Vbd ->
+		sprintf "/local/domain/%d/backend/%s/%d/%d/hotplug-status"
+			x.backend.domid (string_of_kind x.backend.kind) x.frontend.domid x.frontend.devid
+	| k -> failwith (Printf.sprintf "No xenstore interface for this kind of device: %s" (string_of_kind k))
+
+let hotplugged ~xs (x: device) =
+	let path = path_written_by_hotplug_scripts x in
+	debug "Checking to see whether %s" path;
+	try ignore(xs.Xs.read path); true with Xenbus.Xb.Noent -> false
 
 (* The path in xenstore written to by the frontend hotplug scripts *)
 let frontend_status_node (x: device) = 
 	sprintf "%s/frontend/%s/%d/hotplug" (get_private_path x.frontend.domid) (string_of_kind x.frontend.kind) x.frontend.devid
-
-(* The path in xenstore written to /by/ the hotplug scripts when the (network) device
-   is properly online.
-   See xs-xen.pq.hq:91e986b8e49f netback-wait-for-hotplug *)
-let connected_node ~xs (x: device) = 
-	sprintf "%s/backend/%s/%d/%d/hotplug-status" (xs.Xs.getdomainpath x.backend.domid) (string_of_kind x.backend.kind) x.frontend.domid x.frontend.devid
 
 (* CA-15605: node written to by tapdisk to report an error (eg opening .vhd files). *)
 let tapdisk_error_node ~xs (x: device) = 
@@ -92,31 +93,24 @@ let blkback_error_node ~xs (x: device) =
    (ie not an API-initiated hotunplug; this is start of day) then we check the state 
    of the backend hotplug scripts. *)
 let device_is_online ~xs (x: device) = 
-  let backend_hotplug () = try xs.Xs.read (status_node x) = "online" with Xb.Noent -> false
-  and backend_shutdown () = try ignore(xs.Xs.read (backend_shutdown_done_path_of_device ~xs x)); true with Xb.Noent -> false 
-  and backend_request () = try ignore(xs.Xs.read (backend_shutdown_request_path_of_device ~xs x)); true with Xb.Noent -> false in
+  let backend_shutdown () = try ignore(xs.Xs.read (backend_shutdown_done_path_of_device ~xs x)); true with Xenbus.Xb.Noent -> false 
+  and backend_request () = try ignore(xs.Xs.read (backend_shutdown_request_path_of_device ~xs x)); true with Xenbus.Xb.Noent -> false in
 
   match x.backend.kind with
-  | Pci | Vkbd | Vfb  -> assert false (* PCI backend doesn't create online node *)
-  | Vif -> backend_hotplug ()
+  | Pci | Vfs | Vkbd | Vfb -> assert false (* PCI backend doesn't create online node *)
+  | Vif -> hotplugged ~xs x
   | ( Vbd | Tap ) -> 
       if backend_request () 
       then not(backend_shutdown ())
-      else backend_hotplug ()
-
-(* Poll a device (vif) to see whether it has hotplug-status = connected *)
-let device_is_connected ~xs (x: device) =
-	try
-		let path = connected_node ~xs x in
-		xs.Xs.read path = "connected"
-	with Xb.Noent -> false
+      else hotplugged ~xs x
 
 let wait_for_plug ~xs (x: device) = 
   debug "Hotplug.wait_for_plug: %s" (string_of_device x);
   try
     Stats.time_this "udev backend add event" 
       (fun () ->
-    ignore(Watch.wait_for ~xs ~timeout:hotplug_timeout (Watch.value_to_appear (status_node x)));
+		  let path = path_written_by_hotplug_scripts x in
+		  ignore(Watch.wait_for ~xs ~timeout:!Xapi_globs.hotplug_timeout (Watch.value_to_appear path));
       );
     debug "Synchronised ok with hotplug script: %s" (string_of_device x)
   with Watch.Timeout _ ->
@@ -127,7 +121,8 @@ let wait_for_unplug ~xs (x: device) =
   try
     Stats.time_this "udev backend remove event" 
       (fun () ->
-    ignore(Watch.wait_for ~xs ~timeout:hotplug_timeout (Watch.key_to_disappear (status_node x)));
+		  let path = path_written_by_hotplug_scripts x in
+		  ignore(Watch.wait_for ~xs ~timeout:!Xapi_globs.hotplug_timeout (Watch.key_to_disappear path));
       );
     debug "Synchronised ok with hotplug script: %s" (string_of_device x)
   with Watch.Timeout _ ->
@@ -142,7 +137,7 @@ let wait_for_frontend_plug ~xs (x: device) =
 	let blkback_error_watch = Watch.value_to_appear (blkback_error_node ~xs x) in
     Stats.time_this "udev frontend add event" 
       (fun () ->
-	 match Watch.wait_for ~xs ~timeout:hotplug_timeout 
+	 match Watch.wait_for ~xs ~timeout:!Xapi_globs.hotplug_timeout 
 	 (Watch.any_of [ `OK, ok_watch; `Failed, tapdisk_error_watch; `Failed, blkback_error_watch ]) with
 	 | `OK, _ ->
 	     debug "Synchronised ok with frontend hotplug script: %s" (string_of_device x)
@@ -160,7 +155,7 @@ let wait_for_frontend_unplug ~xs (x: device) =
     let path = frontend_status_node x in
     Stats.time_this "udev frontend remove event" 
       (fun () ->
-    ignore(Watch.wait_for ~xs ~timeout:hotplug_timeout (Watch.key_to_disappear path));
+    ignore(Watch.wait_for ~xs ~timeout:!Xapi_globs.hotplug_timeout (Watch.key_to_disappear path));
       );
     debug "Synchronised ok with frontend hotplug script: %s" (string_of_device x)
   with Watch.Timeout _ ->
@@ -206,7 +201,7 @@ let umount_loopdev loopdev =
 let mount_loopdev ~xs (x: device) file readonly =
 	let path = get_hotplug_path x ^ "/loop-device" in
 	(* Make sure any previous loop device is gone *)
-	(try umount_loopdev (xs.Xs.read path) with Xb.Noent -> ());
+	(try umount_loopdev (xs.Xs.read path) with Xenbus.Xb.Noent -> ());
 	let loopdev = mount_loopdev_file readonly file in
 	debug "Allocated loop device %s" loopdev;
 	debug "xenstore-write %s = %s" path loopdev;

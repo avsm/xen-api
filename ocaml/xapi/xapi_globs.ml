@@ -11,29 +11,33 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU Lesser General Public License for more details.
  *)
- 
+
 (** A central location for settings related to xapi *)
- 
+
 open Stringext
 open Printf
-open Util_globs_inventory
+
+module D = Debug.Debugger(struct let name="xapi_globs" end)
+
+(* set this to true to use the experimental codepath *)
+let use_xenopsd = ref false
 
 (* xapi process returns this code on exit when it wants to be restarted *)
 let restart_return_code = 123
 
-let pool_secret_path = "/etc/xensource/ptoken"
+let pool_secret_path = Filename.concat Fhs.etcdir "ptoken"
 let pool_secret = ref ""
 
 let localhost_ref : [`host] Ref.t ref = ref Ref.null
 
 (* xapi version *)
-let version_major = 1
-let version_minor = 3
+let version_major = Version.xapi_version_major
+let version_minor = Version.xapi_version_minor
 let xapi_user_agent = "xapi/"^(string_of_int version_major)^"."^(string_of_int version_minor)
 
 (* api version *)
 let api_version_major = 1L
-let api_version_minor = 9L
+let api_version_minor = 10L
 let api_version_string =
   Printf.sprintf "%Ld.%Ld" api_version_major api_version_minor
 let api_version_vendor = "XenSource"
@@ -43,12 +47,12 @@ let api_version_vendor_implementation = []
 let tools_version = ref (-1, -1, -1, -1)
 
 (* client min/max version range *)
-let xencenter_min_verstring = "1.9"
-let xencenter_max_verstring = "1.9"
+let xencenter_min_verstring = "1.10"
+let xencenter_max_verstring = "1.10"
 
 (* linux pack vsn key in host.software_version (used for a pool join restriction *)
 let linux_pack_vsn_key = "xs:linux"
-let packs_dir = "/etc/xensource/installed-repos"
+let packs_dir = Filename.concat Fhs.etcdir "installed-repos"
 
 let ssl_pid = ref 0
 
@@ -62,18 +66,11 @@ let https_port = ref default_ssl_port
 
 let xapi_gc_debug = ref true
 
-let unix_domain_socket = "/var/xapi/xapi"
-let storage_unix_domain_socket = "/var/xapi/storage"
-let local_database = "/var/xapi/local.db"
+let unix_domain_socket = Filename.concat Fhs.vardir "xapi"
+let local_storage_unix_domain_socket = Filename.concat Fhs.vardir "storage-local"
+let storage_unix_domain_socket = Filename.concat Fhs.vardir "storage"
+let local_database = Filename.concat Fhs.vardir "local.db"
 
-(* amount of time to retry master_connection before (if restart_on_connection_timeout is set) restarting xapi; -ve means don't timeout: *)
-let master_connect_retry_timeout = -1. (* never timeout *)
-
-(* the time taken to wait before restarting in a different mode for pool eject/join operations *)
-let fuse_time = 10
-
-(* the time taken to wait before restarting after restoring db backup *)
-let db_restore_fuse_time = 30
 
 (* if a slave in emergency "cannot see master mode" then this flag is set *)
 let slave_emergency_mode = ref false
@@ -82,11 +79,6 @@ let slave_emergency_mode = ref false
     without trawling through logfiles *)
 let emergency_mode_error = ref (Api_errors.Server_error(Api_errors.host_still_booting, []))
 
-(* Interval between host heartbeats *)
-let host_heartbeat_interval = 30.0
-(* If we haven't heard a heartbeat from a host for this interval then the host is assumed dead *)
-let host_assumed_dead_interval = 600.0 (* 10 minutes *)
-
 let http_realm = "xapi"
 
 (* Special XS entry looked for by the XenSource PV drivers (see xenagentd.hg:src/xad.c) *)
@@ -94,18 +86,17 @@ let xe_key = "/mh/XenSource-TM_XenEnterprise-TM"
 let xe_val = "XenSource(TM) and XenEnterprise(TM) are registered trademarks of XenSource Inc."
 
 (* Base path and some of its immediate dependencies. *)
-let base_path = Config_constants.base_path
-let xe_path = base_path ^ "/bin/xe"
-let sm_dir = base_path ^ "/sm"
+let xe_path = Filename.concat Fhs.bindir "xe"
+let sm_dir = Filename.concat Fhs.optdir "sm"
 
-let config_file = ref "/etc/xapi.conf"
-let log_config_file = ref "/etc/xensource/log.conf"
-let db_conf_path = "/etc/xensource/db.conf"
-let remote_db_conf_fragment_path = "/etc/xensource/remote.db.conf"
+let config_file = ref Fhs.xapiconf
+let log_config_file = ref (Filename.concat Fhs.etcdir "log.conf")
+let db_conf_path = Filename.concat Fhs.etcdir "db.conf"
+let remote_db_conf_fragment_path = Filename.concat Fhs.etcdir "remote.db.conf"
 let simulator_config_file = ref "/etc/XenServer-simulator.conf"
-let pool_config_file = "/etc/xensource/pool.conf"
-let cpu_info_file = "/etc/xensource/boot_time_cpus"
-let initial_host_free_memory_file = "/etc/xensource/boot_time_memory"
+let pool_config_file = Filename.concat Fhs.etcdir "pool.conf"
+let cpu_info_file = Filename.concat Fhs.etcdir "boot_time_cpus"
+let initial_host_free_memory_file = "/var/run/xapi/boot_time_memory"
 let using_rrds = ref false
 
 let ready_file = ref ""
@@ -119,9 +110,11 @@ let _date = "date"
 let _product_version = "product_version"
 let _product_version_text = "product_version_text"
 let _product_version_text_short = "product_version_text_short"
+let _platform_name = "platform_name"
+let _platform_version = "platform_version"
 let _product_brand = "product_brand"
 let _build_number = "build_number"
-let _hg_id = "hg_id"
+let _git_id = "git_id"
 let _api_major = "API_major"
 let _api_minor = "API_minor"
 let _api_vendor = "API_vendor"
@@ -131,18 +124,30 @@ let _xapi_minor = "xapi_minor"
 let _export_vsn = "export_vsn"
 let _dbv = "dbv"
 
+(* When comparing two host versions, always treat a host that has platform_version defined as newer
+ * than any host that does not have platform_version defined.
+ * Substituting this default when a host does not have platform_version defined will be acceptable,
+ * as long as a host never has to distinguish between two hosts of different versions which are both
+ * older than itself. *)
+let default_platform_version = "0.0.0"
+
 (* Used to differentiate between 
    Rio beta2 (0) [no inline checksums, end-of-tar checksum table],
    Rio GA (1) [inline checksums, end-of-tar checksum table]
    and Miami GA (2) [inline checksums, no end-of-tar checksum table] *)
 let export_vsn = 2
 
-let software_version = [ _product_version, Version.product_version;
+let software_version =
+	(* In the case of XCP, all product_* fields will be blank. *)
+	List.filter (fun (_, value) -> value <> "")
+		[_product_version, Version.product_version;
 			_product_version_text,       Version.product_version_text;
 			_product_version_text_short, Version.product_version_text_short;
+			_platform_name, Version.platform_name;
+			_platform_version, Version.platform_version;
 			 _product_brand,   Version.product_brand;
 			 _build_number,    Version.build_number;
-			 _hg_id,           Version.hg_id;
+			 _git_id,           Version.git_id;
 			 _hostname,        Version.hostname;
 			 _date,            Version.date]
 
@@ -183,12 +188,14 @@ let tools_sr_tag = "xenserver_tools_sr"
 let rio_tools_sr_name = "XenSource Tools"
 let miami_tools_sr_name = "XenServer Tools"
 
-let tools_sr_dir = base_path ^ "/packages/iso"
+let tools_sr_dir = Filename.concat Fhs.sharedir "packages/iso"
 
 let default_template_key = "default_template"
 let linux_template_key = "linux_template"
 
-let vbd_task_key = "task_id" (* set on dom0 block-attached VBDs to indicate the task they're associated with *)
+(* Keys to explain the presence of dom0 block-attached VBDs: *)
+let vbd_task_key = "task_id"
+let related_to_key = "related_to"
 
 (* Set to true on the P2V server template and the tools SR *)
 let xensource_internal = "xensource_internal"
@@ -198,7 +205,7 @@ let logrot_max = ref (1024*16*1024)
 (* logrotate is called without a stdin, and when it fork-and-execs gzip, it opens the src *)
 (* getting fd 0, opens the dest getting fd 3, then forks, then dups 0 to 0, dups 3 to 1 and *)
 (* then closes 0 and 3! *)
-let logrot_cmd = base_path ^ "/libexec/logrotate.sh"
+let logrot_cmd = Filename.concat Fhs.libexecdir "logrotate.sh"
 let logrot_arg = [ ]
 
 (* Error codes for internal storage backends -- these have counterparts in sm.hg/drivers/XE_SR_ERRORCODES.xml *)
@@ -210,16 +217,16 @@ let sm_error_generic_VDI_create_failure = 78
 let sm_error_generic_VDI_delete_failure = 80
 
 (* temporary restore path for db *)
-let db_temporary_restore_path = "/var/xapi/restore_db.db"
+let db_temporary_restore_path = Filename.concat Fhs.vardir "restore_db.db"
 
 (* temporary path for the HA metadata database *)
-let ha_metadata_db = "/var/xapi/ha_metadata.db"
+let ha_metadata_db = Filename.concat Fhs.vardir "ha_metadata.db"
 
 (* temporary path for the general metadata database *)
-let gen_metadata_db = "/var/xapi/gen_metadata.db"
+let gen_metadata_db = Filename.concat Fhs.vardir "gen_metadata.db"
 
 (* temporary path for opening a foreign metadata database *)
-let foreign_metadata_db = "/var/xapi/foreign.db"
+let foreign_metadata_db = Filename.concat Fhs.vardir "foreign.db"
 
 let migration_failure_test_key = "migration_wings_fall_off" (* set in other-config to simulate migration failures *)
 
@@ -227,30 +234,12 @@ let migration_failure_test_key = "migration_wings_fall_off" (* set in other-conf
    the disk flushing *)
 let migration_extra_paths_key = "migration_extra_paths"
 
-(* If a session has a last_active older than this we delete it *)
-let inactive_session_timeout = 24. *. 60. *. 60. (* 24 hrs in seconds *) 
-
 (* After this we start to delete completed tasks (never pending ones) *)
 let max_tasks = 200
 
 (* After this we start to invalidate older sessions *)
 (* We must allow for more sessions than running tasks *)
 let max_sessions = max_tasks * 2
-
-let completed_task_timeout = 65. *. 60. (* 65 mins *)
-
-let pending_task_timeout = 24. *. 60. *. 60. (* 24 hrs in seconds *) 
-
-(* After this we start to delete alerts *)
-let alert_timeout = completed_task_timeout +. 1.
-
-(* Don't reboot a domain which crashes too quickly: *)
-let minimum_time_between_bounces = 120. (* 2 minutes *)
-
-(* If a domain is rebooted (from inside) in less than this time since it last started, then insert an artificial delay: *)
-let minimum_time_between_reboot_with_no_added_delay = 60. (* 1 minute *)
-(* the size of the artificial delay is: *)
-let artificial_reboot_delay = 30.
 
 (* The Unix.time that represents the maximum time in the future that a 32 bit time can cope with *)
 let the_future = 2147483647.0
@@ -277,26 +266,14 @@ let pool_ha_num_host_failures = "ha_tolerated_host_failures"
 (* the other-config key that reflects whether the pool is overprovisioned *)
 let pool_ha_currently_over_provisioned = "ha_currently_over_provisioned"
 
-let ha_monitor_timer = 20. (* seconds *)
-
-let ha_monitor_startup_timeout = 30. *. 60. (* seconds *)
-
-(* Unconditionally replan every once in a while just in case the overcommit protection is buggy and we don't notice *)
-let ha_monitor_plan_timer = 30. *. 60. (* seconds *)
-
-let backup_db = "/var/xapi/state-backup.db"
+let backup_db = Filename.concat Fhs.vardir "state-backup.db"
 
 (* Place where database XML backups are kept *)
-let backup_db_xml = "/var/xapi/state-backup.xml"
-
-(* Time to wait before fencing in the case when this host isn't a master, isn't in 
-   emergency mode and has no running VMs before fencing. This is intended to give
-   the admin some time to fix a broken configuration.*)
-let noncritical_fence_timeout = 5. *. 60. (* 5 minutes *)
+let backup_db_xml = Filename.concat Fhs.vardir "state-backup.xml"
 
 (* Directory containing scripts which are executed when a node becomes master
    and when a node gives up the master role *)
-let master_scripts_dir = "/etc/xensource/master.d"
+let master_scripts_dir = Filename.concat Fhs.etcdir "master.d"
 
 (* Indicates whether we should allow clones of suspended VMs via VM.clone *)
 let pool_allow_clone_suspended_vm = "allow_clone_suspended_vm"
@@ -305,8 +282,8 @@ let pool_allow_clone_suspended_vm = "allow_clone_suspended_vm"
 let shared_db_vdi_size = 134217728L (* 128 * 1024 * 1024 = 128 megs *)
 
 (* Mount point for the shared DB *)
-let shared_db_mount_point = "/var/xapi/shared_db"
-let snapshot_db = "/var/xapi/snapshot.db"
+let shared_db_mount_point = Filename.concat Fhs.vardir "shared_db"
+let snapshot_db = Filename.concat Fhs.vardir "snapshot.db"
 
 (* Device for shared DB VBD *)
 let shared_db_device = "15"
@@ -351,6 +328,7 @@ let sync_copy_license_to_db = "sync_copy_license_to_db"
 let sync_create_host_cpu = "sync_create_host_cpu"
 let sync_create_domain_zero = "sync_create_domain_zero"
 let sync_crashdump_resynchronise = "sync_crashdump_resynchronise"
+let sync_pbds = "sync_pbds"
 let sync_update_vms = "sync_update_vms"
 let sync_remove_leaked_vbds = "sync_remove_leaked_vbds"
 let sync_pif_params = "sync_pif_params"
@@ -364,6 +342,9 @@ let sync_gpus = "sync_gpus"
 (* create_storage *)
 let sync_create_pbds = "sync_create_pbds"
 
+(* sync VLANs on slave with master *)
+let sync_vlans = "sync_vlans"
+
 (* Set on the Pool.other_config to signal that the pool is currently in a mixed-mode
    rolling upgrade state. *)
 let rolling_upgrade_in_progress = "rolling_upgrade_in_progress"
@@ -373,10 +354,10 @@ let default_ha_timeout = "default_ha_timeout"
 
 (* Executed during startup when the API/database is online but before storage or networks
    are fully initialised. *)
-let startup_script_hook = base_path ^ "/libexec/xapi-startup-script"
+let startup_script_hook = Filename.concat Fhs.libexecdir "xapi-startup-script"
 
 (* Executed when a rolling upgrade is detected starting or stopping *)
-let rolling_upgrade_script_hook = base_path ^ "/libexec/xapi-rolling-upgrade"
+let rolling_upgrade_script_hook = Filename.concat Fhs.libexecdir "xapi-rolling-upgrade"
 
 (* When set to true indicates that the host has still booted so we're initialising everything
    from scratch e.g. shared storage, sampling boot free mem etc *)
@@ -389,12 +370,12 @@ let listen_backlog = 128
 let artificial_reboot_delay = "artificial-reboot-delay"
 
 (* Xapi script hooks root *)
-let xapi_hooks_root = "/etc/xapi.d/"
+let xapi_hooks_root = Fhs.hooksdir 
 
 (* RRD storage location *)
-let xapi_rrd_location = "/var/xapi/blobs/rrds"
+let xapi_rrd_location = Filename.concat Fhs.vardir "blobs/rrds"
 
-let xapi_blob_location = "/var/xapi/blobs"
+let xapi_blob_location = Filename.concat Fhs.vardir "blobs"
 
 let last_blob_sync_time = "last_blob_sync_time"
 
@@ -412,19 +393,17 @@ let http_limit_max_rpc_size = 300 * 1024 (* 300K *)
 let http_limit_max_cli_size = 200 * 1024 (* 200K *)
 let http_limit_max_rrd_size = 2 * 1024 * 1024 (* 2M -- FIXME : need to go below 1mb for security purpose. *)
 
-let sync_timer = 3600.0 *. 24.0 (* sync once a day *)
-
 let message_limit=10000
 
-let xapi_message_script = base_path ^ "/libexec/mail-alarm"
+let xapi_message_script = Filename.concat Fhs.libexecdir "mail-alarm"
 
 (* Emit a warning if more than this amount of clock skew detected *)
 let max_clock_skew = 5. *. 60. (* 5 minutes *)
 
 (* Optional directory containing XenAPI plugins *)
-let xapi_plugins_root = "/etc/xapi.d/plugins"
+let xapi_plugins_root = Fhs.plugindir 
 
-let guest_liveness_timeout = 5.0 *. 60.0 
+
 
 (** CA-18377: Providing lists of operations that were supported by the Miami release. *)
 (** For now, we check against these lists when sending data across the wire that may  *)
@@ -510,24 +489,6 @@ let memory_ratio_pv  = ("memory-ratio-pv", "0.25")
 (** The maximum allowed number of redo_log instances. *)
 let redo_log_max_instances = 8
 
-(** The maximum time, in seconds, for which we are prepared to wait for a response from the block device I/O process before assuming that it has died while emptying *)
-let redo_log_max_block_time_empty = 2.
-
-(** The maximum time, in seconds, for which we are prepared to wait for a response from the block device I/O process before assuming that it has died while reading *)
-let redo_log_max_block_time_read = 30.
-
-(** The maximum time, in seconds, for which we are prepared to wait for a response from the block device I/O process before assuming that it has died while writing a delta *)
-let redo_log_max_block_time_writedelta = 2.
-
-(** The maximum time, in seconds, for which we are prepared to wait for a response from the block device I/O process before assuming that it has died while writing a database *)
-let redo_log_max_block_time_writedb = 30.
-
-(** The maximum time, in seconds, for which we are prepared to wait for a response from the block device I/O process before assuming that it has died while initially connecting to it *)
-let redo_log_max_startup_time = 5.
-
-(** The delay between each attempt to connect to the block device I/O process *)
-let redo_log_connect_delay = 0.1
-
 (** The prefix of the file used as a socket to communicate with the block device I/O process *)
 let redo_log_comms_socket_stem = "sock-blkdev-io"
 
@@ -570,11 +531,7 @@ let serialize_pool_enable_disable_extauth = Mutex.create()
 let event_hook_auth_on_xapi_initialize_succeeded = ref false
 
 (** Directory used by the v6 license policy engine for caching *)
-let upgrade_grace_file = "/var/xapi/ugp"
-
-
-(** Time after which we conclude that a VM really is unco-operative *)
-let cooperative_timeout = 30.
+let upgrade_grace_file = Filename.concat Fhs.vardir "ugp"
 
 (** Where the ballooning daemon writes the initial overhead value *)
 let squeezed_reserved_host_memory = "/squeezed/reserved-host-memory"
@@ -611,7 +568,7 @@ let old_dell_bios_strings =
 	 "oem-2", "5[0000]";
 	 "oem-3", "MS_VM_CERT/SHA1/bdbeb6e0a816d43fa6d3fe8aaef04c2bad9d3e3d";
 	 "hp-rombios", ""]
-	 
+
 (** BIOS strings of the old (XS 5.5) HP Edition *)
 let old_hp_bios_strings =
 	["bios-vendor", "Xen";
@@ -623,9 +580,6 @@ let old_hp_bios_strings =
 	 "oem-1", "Xen";
 	 "oem-2", "MS_VM_CERT/SHA1/bdbeb6e0a816d43fa6d3fe8aaef04c2bad9d3e3d";
 	 "hp-rombios", "COMPAQ"]
-
-
-let permanent_master_failure_retry_timeout = 1. *. 60. (* 1 minute *)
 
 (** {2 CPUID feature masking} *)
 
@@ -640,4 +594,222 @@ let cpuid_default_feature_mask = "ffffff7f-ffffffff-ffffffff-ffffffff"
 let network_reset_trigger = "/tmp/network-reset"
 
 let first_boot_dir = "/etc/firstboot.d/"
+
+
+(** Dynamic configurations to be read whenever xapi (re)start *)
+
+let master_connection_reset_timeout = ref 120.
+
+(* amount of time to retry master_connection before (if
+   restart_on_connection_timeout is set) restarting xapi; -ve means don't
+   timeout: *)
+let master_connection_retry_timeout = ref (-1.)
+
+let master_connection_default_timeout = ref 10.
+
+let qemu_dm_ready_timeout = ref 300.
+
+(* seconds per balancing check *)
+let squeezed_balance_check_interval = ref 10.
+
+(* Time we allow for the hotplug scripts to run before we assume something bad
+   has happened and abort *)
+let hotplug_timeout = ref 300.
+
+let pif_reconfigure_ip_timeout = ref 300.
+
+(* CA-16878: 5 minutes, same as the local database flush *)
+let pool_db_sync_interval = ref 300.
+(* blob/message/rrd file syncing - sync once a day *)
+let pool_data_sync_interval = ref 86400.
+
+let domain_shutdown_ack_timeout = ref 10.
+let domain_shutdown_total_timeout = ref 720.
+
+(* The actual reboot delay will be a random value between base and base + extra *)
+let emergency_reboot_delay_base = ref 60.
+let emergency_reboot_delay_extra = ref 120.
+
+let ha_xapi_healthcheck_interval = ref 60
+let ha_xapi_healthcheck_timeout = ref 120 (* > the number of attempts in xapi-health-check script *)
+let ha_xapi_restart_attempts = ref 1
+let ha_xapi_restart_timeout = ref 300 (* 180s is max start delay and 60s max shutdown delay in the initscript *)
+
+(* Logrotate - poll the amount of data written out by the logger, and call
+   logrotate when it exceeds the threshold *)
+let logrotate_check_interval = ref 300.
+
+let rrd_backup_interval = ref 86400.
+
+(* CP-703: Periodic revalidation of externally-authenticated sessions *)
+let session_revalidation_interval = ref 300. (* every 5 minutes *)
+
+(* CP-820: other-config field in subjects should be periodically refreshed *)
+let update_all_subjects_interval = ref 900. (* every 15 minutes *)
+
+(* The default upper bound on the length of time to wait for a running VM to
+   reach its current memory target. *)
+let wait_memory_target_timeout = ref 256.
+
+let snapshot_with_quiesce_timeout = ref 600.
+
+(* Interval between host heartbeats *)
+let host_heartbeat_interval = ref 30.
+
+(* If we haven't heard a heartbeat from a host for this interval then the host is assumed dead *)
+let host_assumed_dead_interval = ref 600.0
+
+(* the time taken to wait before restarting in a different mode for pool eject/join operations *)
+let fuse_time = ref 10.
+
+(* the time taken to wait before restarting after restoring db backup *)
+let db_restore_fuse_time = ref 30.
+
+(* If a session has a last_active older than this we delete it *)
+let inactive_session_timeout = ref 86400. (* 24 hrs in seconds *) 
+
+let pending_task_timeout = ref 86400. (* 24 hrs in seconds *)
+
+let completed_task_timeout = ref 3900. (* 65 mins *)
+
+(* Don't reboot a domain which crashes too quickly: *)
+let minimum_time_between_bounces = ref 120. (* 2 minutes *)
+
+(* If a domain is rebooted (from inside) in less than this time since it last
+   started, then insert an artificial delay: *)
+let minimum_time_between_reboot_with_no_added_delay = ref 60. (* 1 minute *)
+
+let ha_monitor_interval = ref 20.
+(* Unconditionally replan every once in a while just in case the overcommit
+   protection is buggy and we don't notice *)
+let ha_monitor_plan_interval = ref 1800.
+
+let ha_monitor_startup_timeout = ref 1800.
+
+let ha_default_timeout_base = ref 60.
+
+let guest_liveness_timeout = ref 300.
+
+let permanent_master_failure_retry_interval = ref 60.
+
+(** The maximum time, in seconds, for which we are prepared to wait for a response from the block device I/O process before assuming that it has died while emptying *)
+let redo_log_max_block_time_empty = ref 2.
+
+(** The maximum time, in seconds, for which we are prepared to wait for a response from the block device I/O process before assuming that it has died while reading *)
+let redo_log_max_block_time_read = ref 30.
+
+(** The maximum time, in seconds, for which we are prepared to wait for a response from the block device I/O process before assuming that it has died while writing a delta *)
+let redo_log_max_block_time_writedelta = ref 2.
+
+(** The maximum time, in seconds, for which we are prepared to wait for a response from the block device I/O process before assuming that it has died while writing a database *)
+let redo_log_max_block_time_writedb = ref 30.
+
+(** The maximum time, in seconds, for which we are prepared to wait for a response from the block device I/O process before assuming that it has died while initially connecting to it *)
+let redo_log_max_startup_time = ref 5.
+
+(** The delay between each attempt to connect to the block device I/O process *)
+let redo_log_connect_delay = ref 0.1
+
+let xapi_globs_spec =
+	[ "master_connection_reset_timeout",
+	  Config.Set_float master_connection_reset_timeout;
+	  "master_connection_retry_timeout",
+	  Config.Set_float master_connection_retry_timeout;
+	  "master_connection_default_timeout",
+	  Config.Set_float master_connection_default_timeout;
+	  "qemu_dm_ready_timeout",
+	  Config.Set_float qemu_dm_ready_timeout;
+	  "squeezed_balance_check_interval",
+	  Config.Set_float squeezed_balance_check_interval;
+	  "hotplug_timeout",
+	  Config.Set_float hotplug_timeout;
+	  "pif_reconfigure_ip_timeout",
+	  Config.Set_float pif_reconfigure_ip_timeout;
+	  "pool_db_sync_interval",
+	  Config.Set_float pool_db_sync_interval;
+	  "pool_data_sync_interval",
+	  Config.Set_float pool_data_sync_interval;
+	  "domain_shutdown_ack_timeout",
+	  Config.Set_float domain_shutdown_ack_timeout;
+	  "domain_shutdown_total_timeout",
+	  Config.Set_float domain_shutdown_total_timeout;
+	  "emergency_reboot_delay_base",
+	  Config.Set_float emergency_reboot_delay_base;
+	  "emergency_reboot_delay_extra",
+	  Config.Set_float emergency_reboot_delay_extra;
+	  "ha_xapi_healthcheck_interval",
+	  Config.Set_int ha_xapi_healthcheck_interval;
+	  "ha_xapi_healthcheck_timeout",
+	  Config.Set_int ha_xapi_healthcheck_timeout;
+	  "ha_xapi_restart_attempts",
+	  Config.Set_int ha_xapi_restart_attempts;
+	  "ha_xapi_restart_timeout",
+	  Config.Set_int ha_xapi_restart_timeout;
+	  "logrotate_check_interval",
+	  Config.Set_float logrotate_check_interval;
+	  "rrd_backup_interval",
+	  Config.Set_float rrd_backup_interval;
+	  "session_revalidation_interval",
+	  Config.Set_float session_revalidation_interval;
+	  "update_all_subjects_interval",
+	  Config.Set_float update_all_subjects_interval;
+	  "wait_memory_target_timeout",
+	  Config.Set_float wait_memory_target_timeout;
+	  "snapshot_with_quiesce_timeout",
+	  Config.Set_float snapshot_with_quiesce_timeout;
+	  "host_heartbeat_interval",
+	  Config.Set_float host_heartbeat_interval;
+	  "host_assumed_dead_interval",
+	  Config.Set_float host_assumed_dead_interval;
+	  "fuse_time",
+	  Config.Set_float fuse_time;
+	  "db_restore_fuse_time",
+	  Config.Set_float db_restore_fuse_time;
+	  "inactive_session_timeout",
+	  Config.Set_float inactive_session_timeout;
+	  "pending_task_timeout",
+	  Config.Set_float pending_task_timeout;
+	  "completed_task_timeout",
+	  Config.Set_float completed_task_timeout;
+	  "minimum_time_between_bounces",
+	  Config.Set_float minimum_time_between_bounces;
+	  "minimum_time_between_reboot_with_no_added_delay",
+	  Config.Set_float minimum_time_between_reboot_with_no_added_delay;
+	  "ha_monitor_interval",
+	  Config.Set_float ha_monitor_interval;
+	  "ha_monitor_plan_interval",
+	  Config.Set_float ha_monitor_plan_interval;
+	  "ha_monitor_startup_timeout",
+	  Config.Set_float ha_monitor_startup_timeout;
+	  "ha_default_timeout_base",
+	  Config.Set_float ha_default_timeout_base;
+	  "guest_liveness_timeout",
+	  Config.Set_float guest_liveness_timeout;
+	  "permanent_master_failure_retry_interval",
+	  Config.Set_float permanent_master_failure_retry_interval;
+	  "redo_log_max_block_time_empty",
+	  Config.Set_float redo_log_max_block_time_empty;
+	  "redo_log_max_block_time_read",
+	  Config.Set_float redo_log_max_block_time_read;
+	  "redo_log_max_block_time_writedelta",
+	  Config.Set_float redo_log_max_block_time_writedelta;
+	  "redo_log_max_block_time_writedb",
+	  Config.Set_float redo_log_max_block_time_writedb;
+	  "redo_log_max_startup_time",
+	  Config.Set_float redo_log_max_startup_time;
+	  "redo_log_connect_delay",
+	  Config.Set_float redo_log_connect_delay;
+	]
+
+let xapi_globs_conf = "/etc/xensource/xapi_globs.conf"
+
+let read_external_config () =
+	let unknown_key k v = D.warn "Unknown key/value pairs: (%s, %s)" k v in
+	if Sys.file_exists xapi_globs_conf then begin
+		(* Will raise exception if xapi_globs.conf is mis-formatted. It's up to the
+		   caller to inspect and handle the failure.
+		*)
+		Config.read xapi_globs_conf xapi_globs_spec unknown_key;
+		D.info "Read global variables successfully from %s" xapi_globs_conf
+	end
 

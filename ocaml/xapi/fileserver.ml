@@ -55,7 +55,7 @@ let mime_of_extension = function
     | "jpg" | "jpeg" -> "image/jpeg"
 	| _              -> application_octet_stream
 
-let send_file (uri_base: string) (dir: string) (req: Request.t) (bio: Buf_io.t) =
+let send_file (uri_base: string) (dir: string) (req: Request.t) (bio: Buf_io.t) _ =
   let uri_base_len = String.length uri_base in
   let s = Buf_io.fd_of bio in
   Buf_io.assert_buffer_empty bio;
@@ -69,7 +69,7 @@ let send_file (uri_base: string) (dir: string) (req: Request.t) (bio: Buf_io.t) 
 
     if not(String.startswith dir file_path) then begin 
       debug "Rejecting request for file: %s (outside of directory %s)" file_path dir;
-      Http_svr.default_callback req bio
+		Http_svr.response_forbidden ~req s
     end else begin
       let stat = Unix.stat file_path in
       (* if a directory, automatically add index.html *)

@@ -18,7 +18,7 @@ open Datamodel_types
 (* IMPORTANT: Please bump schema vsn if you change/add/remove a _field_.
               You do not have to bump vsn if you change/add/remove a message *)
 let schema_major_vsn = 5
-let schema_minor_vsn = 63
+let schema_minor_vsn = 64
 
 (* Historical schema versions just in case this is useful later *)
 let rio_schema_major_vsn = 5
@@ -39,9 +39,12 @@ let midnight_ride_release_schema_minor_vsn = 60
 let cowley_release_schema_major_vsn = 5
 let cowley_release_schema_minor_vsn = 61
 
+let boston_release_schema_major_vsn = 5
+let boston_release_schema_minor_vsn = 63
+
 (* the schema vsn of the last release: used to determine whether we can upgrade or not.. *)
-let last_release_schema_major_vsn = cowley_release_schema_major_vsn
-let last_release_schema_minor_vsn = cowley_release_schema_minor_vsn
+let last_release_schema_major_vsn = boston_release_schema_major_vsn
+let last_release_schema_minor_vsn = boston_release_schema_minor_vsn
 
 (** Bindings for currently specified releases *)
 
@@ -157,6 +160,12 @@ let get_product_releases in_product_since =
       [] -> raise UnspecifiedRelease
     | x::xs -> if x=in_product_since then "closed"::x::xs else go_through_release_order xs
   in go_through_release_order release_order
+
+let tampa_release =
+	{ internal=get_product_releases rel_tampa
+	; opensource=get_oss_releases None
+	; internal_deprecated_since=None
+	}
 
 let boston_release =
 	{ internal=get_product_releases rel_boston
@@ -668,6 +677,8 @@ let _ =
     ~doc:"Cannot join pool whose external authentication configuration is different." ();
   error Api_errors.pool_joining_host_must_have_same_product_version []
     ~doc:"The host joining the pool must have the same product version as the pool master." ();
+  error Api_errors.pool_hosts_not_compatible []
+    ~doc:"The hosts in this pool are not compatible." ();
   error Api_errors.pool_hosts_not_homogeneous [ "reason" ]
     ~doc:"The hosts in this pool are not homogeneous." ();
   error Api_errors.pool_not_in_emergency_mode []
@@ -754,8 +765,8 @@ let _ =
     ~doc:"You attempted to run a VM on a host which doesn't have a pGPU available in the GPU group needed by the VM. The VM has a vGPU attached to this GPU group." ();
   error Api_errors.vm_requires_iommu ["host"]
     ~doc:"You attempted to run a VM on a host which doesn't have I/O virtualisation (IOMMU/VT-d) enabled, which is needed by the VM." ();
-  error Api_errors.vm_resume_incompatible_version ["host"; "vm"]
-    ~doc:"The VM resume could not be performed on this host, because it has a different (incompatible) product version to the pool's master." ();
+  error Api_errors.vm_host_incompatible_version ["host"; "vm"]
+    ~doc:"This VM operation cannot be performed on an older-versioned host during an upgrade." ();
   error Api_errors.vm_has_pci_attached ["vm"]
     ~doc:"This operation could not be performed, because the VM has one or more PCI devices passed through." ();
   error Api_errors.host_cannot_attach_network [ "host"; "network" ]
@@ -1039,6 +1050,8 @@ let _ =
     ~doc:"There is at least on VM assigned to this protection policy." ();
   error Api_errors.vmpp_archive_more_frequent_than_backup []
     ~doc:"Archive more frequent than backup." ();
+  error Api_errors.vm_assigned_to_protection_policy []
+    ~doc:"This VM is assigned to a protection policy." ();
 
   error Api_errors.ssl_verify_error ["reason"]
     ~doc:"The remote system's SSL certificate failed to verify against our certificate library." ();
@@ -1492,6 +1505,7 @@ let vm_assert_can_boot_here = call
 	~errs:[
 		Api_errors.host_not_enough_free_memory;
 		Api_errors.vm_requires_sr;
+		Api_errors.vm_host_incompatible_version;
 	]
 	()
 
@@ -1871,6 +1885,30 @@ let vm_pool_migrate = call
   ~allowed_roles:_R_VM_POWER_ADMIN
   ()
 
+let vm_pool_migrate_complete = call
+  ~in_oss_since:None 
+  ~in_product_since:rel_tampa
+  ~name:"pool_migrate_complete"
+  ~doc:"Tell a destination host that migration is complete."
+  ~params:[Ref _vm, "vm", "The VM which has finished migrating";
+	   Ref _host, "host", "The target host" ]
+  ~hide_from_docs:true
+  ~pool_internal:false (* needed for cross-pool migrate too *)
+  ~allowed_roles:_R_VM_POWER_ADMIN
+  ()
+
+let vm_migrate_receive = call
+  ~in_oss_since:None
+  ~in_product_since:rel_tampa
+  ~name:"migrate_receive"
+  ~doc:"Prepare to receive a VM, returning a token which can be passed to VM.migrate."
+  ~params:[Ref _host, "host", "The target host";
+           Ref _sr, "SR", "The target SR";
+		   Map(String, String), "options", "Extra configuration operations" ]
+  ~result:(Map(String,String), "A value which should be passed to VM.migrate")
+  ~allowed_roles:_R_VM_POWER_ADMIN
+  ()
+
 let set_vcpus_number_live = call
 	~name:"set_VCPUs_number_live"
 	~in_product_since:rel_rio
@@ -1951,7 +1989,7 @@ let vm_migrate = call
   ~in_product_since:rel_rio
   ~doc: "Migrate the VM to another host.  This can only be called when the specified VM is in the Running state."
   ~params:[Ref _vm, "vm", "The VM";
-           String, "dest", "The destination host";
+           Map(String,String), "dest", "The result of a VM.migrate_receive call.";
            Bool, "live", "Live migration";
            Map (String, String), "options", "Other parameters"]
   ~errs:[Api_errors.vm_bad_power_state]
@@ -3879,6 +3917,43 @@ let host_sm_dp_destroy = call ~flags:[`Session]
 	~hide_from_docs:true
 	()
 
+let host_sync_vlans = call ~flags:[`Session]
+	~name:"sync_vlans"
+	~lifecycle:[]
+	~doc:"Synchronise VLANs on given host with the master's VLANs"
+	~params:[
+		Ref _host, "host", "The host";
+	]
+	~hide_from_docs:true
+	~pool_internal:true
+	~allowed_roles:_R_POOL_OP
+	()
+
+let host_sync_tunnels = call ~flags:[`Session]
+	~name:"sync_tunnels"
+	~lifecycle:[]
+	~doc:"Synchronise tunnels on given host with the master's tunnels"
+	~params:[
+		Ref _host, "host", "The host";
+	]
+	~hide_from_docs:true
+	~pool_internal:true
+	~allowed_roles:_R_POOL_OP
+	()
+
+let host_sync_pif_currently_attached = call ~flags:[`Session]
+	~name:"sync_pif_currently_attached"
+	~lifecycle:[]
+	~doc:"Synchronise tunnels on given host with the master's tunnels"
+	~params:[
+		Ref _host, "host", "The host";
+		Set String, "bridges", "A list of bridges that are currently up";
+	]
+	~hide_from_docs:true
+	~pool_internal:true
+	~allowed_roles:_R_POOL_OP
+	()
+
 (** Hosts *)
 let host =
     create_obj ~in_db:true ~in_product_since:rel_rio ~in_oss_since:oss_since_303 ~internal_deprecated_since:None ~persist:PersistEverything ~gen_constructor_destructor:false ~name:_host ~descr:"A physical host" ~gen_events:true
@@ -3957,6 +4032,9 @@ let host =
 		 host_get_sm_diagnostics;
 		 host_get_thread_diagnostics;
 		 host_sm_dp_destroy;
+		 host_sync_vlans;
+		 host_sync_tunnels;
+		 host_sync_pif_currently_attached;
 		 ]
       ~contents:
         ([ uid _host;
@@ -4339,6 +4417,7 @@ let bond_mode =
 	Enum ("bond_mode", [
 		"balance-slb", "Source-level balancing";
 		"active-backup", "Active/passive bonding: only one NIC is carrying traffic";
+		"lacp", "Link aggregation control protocol";
 	])
 
 let bond_create = call
@@ -4349,6 +4428,7 @@ let bond_create = call
     {param_type=Set (Ref _pif); param_name="members"; param_doc="PIFs to add to this bond"; param_release=miami_release; param_default=None};
     {param_type=String; param_name="MAC"; param_doc="The MAC address to use on the bond itself. If this parameter is the empty string then the bond will inherit its MAC address from the primary slave."; param_release=miami_release; param_default=None};
     {param_type=bond_mode; param_name="mode"; param_doc="Bonding mode to use for the new bond"; param_release=boston_release; param_default=Some (VEnum "balance-slb")};
+    {param_type=Map (String, String); param_name="properties"; param_doc="Additional configuration parameters specific to the bond mode"; param_release=tampa_release; param_default=Some (VMap [])};
   ]
   ~result:(Ref _bond, "The reference of the created Bond object")
   ~in_product_since:rel_miami
@@ -4374,10 +4454,22 @@ let bond_set_mode = call
 	~allowed_roles:_R_POOL_OP
 	()
 
+let bond_set_property = call
+	~name:"set_property"
+	~doc:"Set the value of a property of the bond"
+	~params:[
+		Ref _bond, "self", "The bond";
+		String, "name", "The property name";
+		String, "value", "The property value";
+	]
+	~in_product_since:rel_tampa
+	~allowed_roles:_R_POOL_OP
+	()
+
 let bond = 
   create_obj ~in_db:true ~in_product_since:rel_miami ~in_oss_since:None ~internal_deprecated_since:None ~persist:PersistEverything ~gen_constructor_destructor:false ~name:_bond ~descr:"" ~gen_events:true ~doccomments:[]
     ~messages_default_allowed_roles:_R_POOL_OP
-    ~messages:[ bond_create; bond_destroy; bond_set_mode ] 
+    ~messages:[ bond_create; bond_destroy; bond_set_mode; bond_set_property ]
     ~contents:
     [ uid _bond;
       field ~in_oss_since:None ~in_product_since:rel_miami ~qualifier:StaticRO ~ty:(Ref _pif) "master" "The bonded interface" ~default_value:(Some (VRef ""));
@@ -4385,6 +4477,7 @@ let bond =
       field ~in_product_since:rel_miami ~default_value:(Some (VMap [])) ~ty:(Map(String, String)) "other_config" "additional configuration";
       field ~lifecycle:[Published, rel_boston, ""] ~qualifier:DynamicRO ~default_value:(Some (VRef (Ref.string_of Ref.null))) ~ty:(Ref _pif) "primary_slave" "The PIF of which the IP configuration and MAC were copied to the bond, and which will receive all configuration/VLANs/VIFs on the bond if the bond is destroyed";
       field ~lifecycle:[Published, rel_boston, ""] ~qualifier:DynamicRO ~default_value:(Some (VEnum "balance-slb")) ~ty:bond_mode "mode" "The algorithm used to distribute traffic among the bonded NICs";
+      field ~in_oss_since:None ~in_product_since:rel_tampa ~qualifier:DynamicRO ~ty:(Map(String, String)) ~default_value:(Some (VMap [])) "properties" "Additional configuration properties specific to the bond mode.";
     ]
     ()
 
@@ -4509,11 +4602,21 @@ let vif_unplug = call
   ~allowed_roles:_R_VM_ADMIN
   ()
 
+let vif_unplug_force = call
+  ~name:"unplug_force"
+  ~in_product_since:rel_boston
+  ~doc:"Forcibly unplug the specified VIF"
+  ~params:[Ref _vif, "self", "The VIF to forcibly unplug"]
+  ~allowed_roles:_R_VM_ADMIN
+  ()
+
 let vif_operations =
   Enum ("vif_operations", 
 	[ "attach", "Attempting to attach this VIF to a VM";
 	  "plug", "Attempting to hotplug this VIF";
-	  "unplug", "Attempting to hot unplug this VIF"; ])
+	  "unplug", "Attempting to hot unplug this VIF";
+	  "unplug_force", "Attempting to forcibly unplug this VIF";
+	])
 
 (** A virtual network interface *)
 let vif =
@@ -4521,7 +4624,7 @@ let vif =
       ~gen_events:true
       ~doccomments:[] 
       ~messages_default_allowed_roles:_R_VM_ADMIN
-      ~messages:[vif_plug; vif_unplug] ~contents:
+      ~messages:[vif_plug; vif_unplug; vif_unplug_force] ~contents:
       ([ uid _vif;
        ] @ (allowed_and_current_operations vif_operations) @ [
 	 field ~qualifier:StaticRO "device" "order in which VIF backends are created by xapi";
@@ -4769,6 +4872,15 @@ let vdi_introduce_params first_rel =
     {param_type=String; param_name="location"; param_doc="location information"; param_release=first_rel; param_default=None};
     {param_type=Map(String, String); param_name="xenstore_data"; param_doc="Data to insert into xenstore"; param_release=first_rel; param_default=Some (VMap [])};
     {param_type=Map(String, String); param_name="sm_config"; param_doc="Storage-specific config"; param_release=miami_release; param_default=Some (VMap [])};
+	{param_type=Bool; param_name = "managed"; param_doc = "Storage-specific config"; param_release=tampa_release; param_default = Some (VBool true) };
+	{param_type=Int; param_name="virtual_size"; param_doc = "Storage-specific config"; param_release=tampa_release; param_default = Some (VInt 0L) };
+	{param_type=Int; param_name="physical_utilisation"; param_doc = "Storage-specific config"; param_release=tampa_release; param_default = Some (VInt 0L) };
+	{param_type=Ref _pool; param_name="metadata_of_pool"; param_doc = "Storage-specific config"; param_release=tampa_release; param_default = Some (VRef "") };
+	{param_type=Bool; param_name="is_a_snapshot"; param_doc = "Storage-specific config"; param_release=tampa_release; param_default = Some (VBool false) };
+	{param_type=DateTime; param_name="snapshot_time"; param_doc = "Storage-specific config"; param_release=tampa_release; param_default = Some (VDateTime Date.never) };
+	{param_type=Ref _vdi; param_name="snapshot_of"; param_doc = "Storage-specific config"; param_release=tampa_release; param_default = Some (VRef "") };
+
+
   ]
 
 (* This used to be called VDI.introduce but it was always an internal call *)
@@ -6099,7 +6211,7 @@ let vm_operations =
 	    vm_cleanReboot; vm_hardShutdown; vm_stateReset; vm_hardReboot;
 	    vm_suspend; csvm; vm_resume; vm_resume_on;
 	    vm_pool_migrate;
-            vm_migrate; 
+        vm_migrate;
 	    vm_get_boot_record; vm_send_sysrq; vm_send_trigger ]
 	@ [ "changing_memory_live", "Changing the memory settings";
 	    "awaiting_memory_live", "Waiting for the memory settings to change";
@@ -6133,7 +6245,8 @@ let vm =
 		vm_cleanReboot; vm_hardShutdown; vm_stateReset; vm_hardReboot; vm_suspend; csvm; vm_resume; 
 		vm_hardReboot_internal;
 		vm_resume_on; 
-		vm_pool_migrate; set_vcpus_number_live;
+		vm_pool_migrate; vm_pool_migrate_complete;
+		set_vcpus_number_live;
 		vm_add_to_VCPUs_params_live;
 		vm_set_ha_restart_priority;  (* updates the allowed-operations of the VM *)
 		vm_set_ha_always_run;        (* updates the allowed-operations of the VM *)
@@ -6155,6 +6268,7 @@ let vm =
 		vm_send_sysrq; vm_send_trigger;
 		vm_maximise_memory;
 		vm_migrate;
+		vm_migrate_receive;
 		vm_get_boot_record;
 		vm_get_data_sources; vm_record_data_source; vm_query_data_source; vm_forget_data_source_archives;
 		assert_operation_valid vm_operations _vm _self;
@@ -7437,13 +7551,16 @@ type action_arg =   (* I'm not using Datamodel_types here because we need vararg
    Bool_query_arg of string |
    Varargs_query_arg
 
-type http_meth = Get | Put | Post | Connect
+type http_meth = Get | Put | Post | Connect | Options
 let rbac_http_permission_prefix = "http/"
 
 (* Each action has:
    (unique public name, (HTTP method, URI, whether to expose in SDK, [args to expose in SDK], [allowed_roles], [(sub-action,allowed_roles)]))
 *)
 let http_actions = [
+  ("get_services", (Get, Constants.services_uri, true, [], _R_READ_ONLY, []));
+  ("post_services", (Post, Constants.services_uri, false, [], _R_POOL_ADMIN, []));
+  ("put_services", (Put, Constants.services_uri, false, [], _R_POOL_ADMIN, []));
   ("post_remote_db_access", (Post, Constants.remote_db_access_uri, false, [], _R_POOL_ADMIN, []));
   ("post_remote_db_access_v2", (Post, Constants.remote_db_access_uri_v2, false, [], _R_POOL_ADMIN, []));
   ("connect_migrate", (Connect, Constants.migrate_uri, false, [], _R_VM_POWER_ADMIN, []));
@@ -7456,6 +7573,8 @@ let http_actions = [
   ("get_export_metadata", (Get, Constants.export_metadata_uri, true, [String_query_arg "uuid"], _R_VM_ADMIN, []));
   ("connect_console", (Connect, Constants.console_uri, false, [], _R_VM_OP, 
     [("host_console", _R_POOL_ADMIN)])); (* only _R_POOL_ADMIN can access the host/Dom0 console *)
+  ("connect_console_ws", (Get, Constants.console_uri, false, [], _R_VM_OP, 
+    [("host_console_ws", _R_POOL_ADMIN)])); (* only _R_POOL_ADMIN can access the host/Dom0 console *)
   ("get_root", (Get, "/", false, [], _R_READ_ONLY, []));
   ("post_cli", (Post, Constants.cli_uri, false, [], _R_READ_ONLY, []));
   ("get_host_backup", (Get, Constants.host_backup_uri, true, [], _R_POOL_ADMIN, []));
@@ -7493,6 +7612,8 @@ let http_actions = [
   ("post_root", (Post, "/", false, [], _R_READ_ONLY, []));
   (* JSON callback *)
   ("post_json", (Post, Constants.json_uri, false, [], _R_READ_ONLY, []));
+  ("post_root_options", (Options, "/", false, [], _R_READ_ONLY, []));
+  ("post_json_options", (Options, Constants.json_uri, false, [], _R_READ_ONLY, []));
 ]
 
 (* these public http actions will NOT be checked by RBAC *)
@@ -7505,6 +7626,8 @@ let public_http_actions_with_no_rbac_check =
 		"post_json"; (* JSON -> calls XMLRPC *)
 		"get_root";  (* Make sure that downloads, personal web pages etc do not go through RBAC asking for a password or session_id *)
 		             (* also, without this line, quicktest_http.ml fails on non_resource_cmd and bad_resource_cmd with a 401 instead of 404 *)
+		"post_root_options"; (* Preflight-requests are not RBAC checked *)
+		"post_json_options"; 
 	]
 
 (* permissions not associated with any object message or field *)

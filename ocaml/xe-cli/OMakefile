@@ -1,5 +1,5 @@
-OCAML_LIBS    = ../idl/ocaml_backend/common ../idl/ocaml_backend/client
-OCAMLINCLUDES = ../idl/ocaml_backend ../xapi
+OCAML_LIBS    = ../fhs ../idl/ocaml_backend/common ../idl/ocaml_backend/client 
+OCAMLINCLUDES = ../idl/ocaml_backend ../xapi ..
 OCAMLPACKS    = xml-light2 stdext stunnel log
 
 section
@@ -11,7 +11,7 @@ section
 
 section
 
-	OCAMLPACKS += xb xs netdev
+	OCAMLPACKS += xenbus xenstore netdev
 	OCAML_CLIBS = ../xenops/statdev_stubs 
 
 	OCamlProgram(fatxe, cli options \
@@ -89,18 +89,22 @@ section
 .PHONY: clean
 clean:
 	rm -f $(CLEAN_OBJS)
+	rm -f ./xe
+	rm -f ./rt/gtclient
+	rm -f ./rt/xgetip
+	rm -f ./rt/gtserver_linux
+	rm -f ./rt/test_host
 
 .SUBDIRS: rt
 
 .PHONY: install
 install:
-	mkdir -p $(BIN_PATH)
-	$(IPROG) xe $(BIN_PATH)
+	mkdir -p $(DESTDIR)$(OPTDIR)/bin
+	$(IPROG) xe $(DESTDIR)$(OPTDIR)/bin
 	mkdir -p $(DESTDIR)/usr/bin
-	ln -sf $(BIN_DIR)/xe $(DESTDIR)/usr/bin/xe
+	ln -sf $(OPTDIR)/bin/xe $(DESTDIR)/usr/bin/xe
 	mkdir -p $(DESTDIR)/etc/bash_completion.d
-	$(IPROG) bash-completion $(DESTDIR)/etc/bash_completion.d/cli
-	mkdir -p $(DEBUGDIST)
+	$(IPROG) bash-completion $(DESTDIR)/etc/bash_completion.d/xe
 
 .PHONY: sdk-install
 sdk-install: install

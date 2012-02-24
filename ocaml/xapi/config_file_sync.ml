@@ -17,7 +17,7 @@ open D
 open Config_file_io
 
 (** URL used by slaves to fetch dom0 config files (currently /etc/passwd) *)
-let config_file_sync_handler (req: Http.Request.t) s =
+let config_file_sync_handler (req: Http.Request.t) s _ =
   debug "received request to write out dom0 config files";
   Xapi_http.with_context "Syncing dom0 config files over HTTP" req s
     (fun __context ->
@@ -38,7 +38,7 @@ let fetch_config_files ~master_address ~pool_secret =
 
 	    let request = Xapi_http.http_request ~cookie:[ "session_id", Ref.string_of session_id ]
 	      Http.Get Constants.config_sync_uri in
-		let open Xmlrpcclient in
+		let open Xmlrpc_client in
 		let transport = SSL (SSL.make (), master_address, !Xapi_globs.https_port) in
 		with_transport transport
 			(with_http request

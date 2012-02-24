@@ -181,7 +181,7 @@ let send_rrd address to_archive uuid rrd =
   let pool_secret = !Xapi_globs.pool_secret in
   let request = Xapi_http.http_request ~cookie:[ "pool_secret", pool_secret ]
     Http.Put (Constants.rrd_put_uri^"?uuid="^uuid^(if to_archive then "&archive=true" else "")) in
-  let open Xmlrpcclient in
+  let open Xmlrpc_client in
   let transport = SSL(SSL.make (), address, !Xapi_globs.https_port) in
   with_transport transport
 	  (with_http request
@@ -375,7 +375,7 @@ let pull_rrd_from_master ~__context uuid is_host =
   let uri = uri ^"?uuid="^uuid^"&dbsync=true" in    
   let request = Xapi_http.http_request ~cookie:[ "pool_secret", pool_secret ] 
     Http.Get uri in
-  let open Xmlrpcclient in
+  let open Xmlrpc_client in
   let transport = SSL(SSL.make (), address, !Xapi_globs.https_port) in
   with_transport transport
 	  (with_http request
@@ -429,7 +429,7 @@ let load_rrd ~__context uuid is_host =
 (** Receive handler, for RRDs being pushed onto us *)
 exception Invalid_RRD
 
-let receive_handler (req: Http.Request.t) (bio: Buf_io.t) =
+let receive_handler (req: Http.Request.t) (bio: Buf_io.t) _ =
   debug "Monitor_rrds.receive_handler";
   let query = req.Http.Request.query in
   req.Http.Request.close <- true;
@@ -479,7 +479,7 @@ let receive_handler (req: Http.Request.t) (bio: Buf_io.t) =
     )
 
 (** Send handler, for sending out requested RRDs *)
-let handler (req: Http.Request.t) s =
+let handler (req: Http.Request.t) s _ =
   debug "Monitor_rrds.handler";
   let query = req.Http.Request.query in
   req.Http.Request.close <- true;
@@ -524,12 +524,12 @@ let handler (req: Http.Request.t) s =
 		     send it off (if it's there) *)
 		  let path = Xapi_globs.xapi_rrd_location ^ "/" ^ uuid in
                   let rrd = rrd_of_gzip path in
-		  Http_svr.headers s (Http.http_200_ok ~version:"1.0" ~keep_alive:false ());
+		  Http_svr.headers s (Http.http_200_ok ~version:"1.0" ~keep_alive:false () @ ["Access-Control-Allow-Origin: *"]);
 		  Rrd.to_fd rrd s
 	      end)
 
 (** Send handler, for sending out requested host RRDs *)
-let handler_host (req: Http.Request.t) s =
+let handler_host (req: Http.Request.t) s _ =
   debug "Monitor_rrds.handler_host";
   let query = req.Http.Request.query in
   req.Http.Request.close <- true;
@@ -553,7 +553,7 @@ let handler_host (req: Http.Request.t) s =
 	    debug "Received request for Host RRD";
 	    Rrd.copy_rrd (match !host_rrd with Some rrdi -> rrdi.rrd | None -> failwith "No host RRD available")
 	  ) in
-	Http_svr.headers s (Http.http_200_ok ~version:"1.0" ~keep_alive:false ());
+	Http_svr.headers s (Http.http_200_ok ~version:"1.0" ~keep_alive:false () @ ["Access-Control-Allow-Origin: *"]);
 	Rrd.to_fd ~json:(List.mem_assoc "json" query) rrd s
       end)
 
@@ -576,7 +576,7 @@ let get_host_stats ?(json=false) start interval cfopt host uuid =
     in
     Rrd.export ~json prefixandrrds start interval cfopt)
 
-let handler_rrd_updates (req: Http.Request.t) s =
+let handler_rrd_updates (req: Http.Request.t) s _ =
   (* This is commonly-called: not worth logging *)
   let query = req.Http.Request.query in
   req.Http.Request.close <- true;

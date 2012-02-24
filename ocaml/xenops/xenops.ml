@@ -16,40 +16,41 @@ open Pervasiveext
 open Stringext
 open Device_common
 open Xenops_helpers
+open Xenstore
 
 let print_xen_dmesg ~xc =
-	let s = Xc.readconsolering xc in
+	let s = Xenctrl.readconsolering xc in
 	printf "%s\n" s
 
 let print_xen_physinfo ~xc =
-	let physinfo = Xc.physinfo xc in
-	let totalmib = Xc.pages_to_mib (Int64.of_nativeint physinfo.Xc.total_pages)
-	and freemib = Xc.pages_to_mib (Int64.of_nativeint physinfo.Xc.free_pages)
-	and scrubmib = Xc.pages_to_mib (Int64.of_nativeint physinfo.Xc.scrub_pages) in
-	printf "nr_cpus = %d\n" physinfo.Xc.nr_cpus;
-	printf "threads_per_core = %d\n" physinfo.Xc.threads_per_core;
-	printf "cores_per_socket = %d\n" physinfo.Xc.cores_per_socket;
-	(*printf "sockets_per_node = %d\n" physinfo.Xc.sockets_per_node;*)
-	(*printf "nr_nodes = %d\n" physinfo.Xc.nr_nodes;*)
-	printf "cpu_khz = %d\n" physinfo.Xc.cpu_khz;
-	printf "total_pages = %s (%Ld Mb)\n" (Nativeint.to_string physinfo.Xc.total_pages) totalmib;
-	printf "free_pages = %s (%Ld Mb)\n" (Nativeint.to_string physinfo.Xc.free_pages) freemib;
-	printf "scrub_pages = %s (%Ld Mb)\n" (Nativeint.to_string physinfo.Xc.scrub_pages) scrubmib
+	let physinfo = Xenctrl.physinfo xc in
+	let totalmib = Xenctrl.pages_to_mib (Int64.of_nativeint physinfo.Xenctrl.total_pages)
+	and freemib = Xenctrl.pages_to_mib (Int64.of_nativeint physinfo.Xenctrl.free_pages)
+	and scrubmib = Xenctrl.pages_to_mib (Int64.of_nativeint physinfo.Xenctrl.scrub_pages) in
+	printf "nr_cpus = %d\n" physinfo.Xenctrl.nr_cpus;
+	printf "threads_per_core = %d\n" physinfo.Xenctrl.threads_per_core;
+	printf "cores_per_socket = %d\n" physinfo.Xenctrl.cores_per_socket;
+	(*printf "sockets_per_node = %d\n" physinfo.Xenctrl.sockets_per_node;*)
+	(*printf "nr_nodes = %d\n" physinfo.Xenctrl.nr_nodes;*)
+	printf "cpu_khz = %d\n" physinfo.Xenctrl.cpu_khz;
+	printf "total_pages = %s (%Ld Mb)\n" (Nativeint.to_string physinfo.Xenctrl.total_pages) totalmib;
+	printf "free_pages = %s (%Ld Mb)\n" (Nativeint.to_string physinfo.Xenctrl.free_pages) freemib;
+	printf "scrub_pages = %s (%Ld Mb)\n" (Nativeint.to_string physinfo.Xenctrl.scrub_pages) scrubmib
 
 let print_pcpus_info ~xc =
-	let physinfo = Xc.physinfo xc in
-	let infos = Xc.pcpu_info xc (physinfo.Xc.nr_cpus) in
+	let physinfo = Xenctrl.physinfo xc in
+	let infos = Xenctrl.pcpu_info xc (physinfo.Xenctrl.nr_cpus) in
 	Array.iteri (fun i info -> printf "cpu: %d  usage: %Ld\n" i info) infos
 
 let debugkeys ~xc args =
 	List.iter (fun arg ->
-		try Xc.send_debug_keys xc arg
+		try Xenctrl.send_debug_keys xc arg
 		with exn ->
 			printf "sending key \"%s\" failed: %s" arg (Printexc.to_string exn);
 	) args
 
 let is_hvm ~xc domid =
-	(Xc.domain_getinfo xc domid).Xc.hvm_guest
+	(Xenctrl.domain_getinfo xc domid).Xenctrl.hvm_guest
 
 let create_domain ~xc ~xs ~hvm =
 	let uuid = Uuid.make_uuid () in
@@ -72,28 +73,11 @@ let build_domain ~xc ~xs ~kernel ?(ramdisk=None) ~cmdline ~domid ~vcpus ~static_
 
 let build_hvm ~xc ~xs ~kernel ~domid ~vcpus ~static_max_kib ~target_kib =
 	let (_: Domain.domarch) = Domain.build_hvm xc xs static_max_kib target_kib 1.
-	                                           vcpus kernel "0" domid in
+	                                           vcpus kernel "0" 4 domid in
 	printf "built hvm domain: %u\n" domid
 
 let clean_shutdown_domain ~xal ~domid ~reason ~sync =
-  let xc = Xal.xc_of_ctx xal in
-  let xs = Xal.xs_of_ctx xal in
-  Domain.shutdown ~xs domid reason;
-  (* Wait for any necessary acknowledgement. If we get a Watch.Timeout _ then
-	 we abort early; otherwise we continue in Xal.wait_release below. *)
-  let acked = try Domain.shutdown_wait_for_ack ~xc ~xs domid reason; true with Watch.Timeout _ -> false in
-	if not acked then (
-		eprintf "domain %u didn't acknowledged shutdown\n" domid;
-	) else (
-		printf "shutdown domain: %u\n" domid;
-		if sync then
-			try
-				ignore (Xal.wait_release xal ~timeout:30. domid);
-				printf "domain shutdowned correctly\n"
-			with Xal.Timeout ->
-				eprintf "domain %u didn't shutdown\n" domid;
-				raise Xal.Timeout
-	)
+	failwith "Use 'xn' instead"
 
 let hard_shutdown_domain ~xc ~domid ~reason = Domain.hard_shutdown ~xc domid reason
 
@@ -142,11 +126,16 @@ let balloon_domain ~xs ~domid ~mem_mib =
 
 let domain_get_uuid ~xc ~domid =
 	try
-		let h = Xc.domain_getinfo xc domid in
-		let uuid = Uuid.to_string (Uuid.uuid_of_int_array h.Xc.handle) in
+		let h = Xenctrl.domain_getinfo xc domid in
+		let uuid = Uuid.to_string (Uuid.uuid_of_int_array h.Xenctrl.handle) in
 		printf "%s\n" uuid
 	with _ ->
 		()
+
+let print_table (rows: string list list) =
+	let widths = Table.compute_col_widths rows in
+	let sll = List.map (List.map2 Table.right widths) rows in
+	List.iter (fun line -> print_endline (String.concat " | " line)) sll
 
 let list_domains ~xc ~verbose =
 	let header () =
@@ -157,26 +146,26 @@ let list_domains ~xc ~verbose =
 		else
 			[ "id"; "state"; "cpu_time"; "uuid" ]
 		in
-	let sl_of_domaininfo (x: Xc.domaininfo) : string list =
+	let sl_of_domaininfo (x: Xenctrl.domaininfo) : string list =
 		let page_to_mib pages =
 			Nativeint.to_string (Nativeint.div pages (Nativeint.of_int 256)) in
 		let int = string_of_int and int64 = Int64.to_string and int32 = Int32.to_string in
-		let domid = int x.Xc.domid in
+		let domid = int x.Xenctrl.domid in
 		(* Can more than one flag be true at a time? *)
 		let state =
 			let bool ch = function true -> ch | _ -> " " in
-			(bool "D" x.Xc.dying) ^ (bool "S" x.Xc.shutdown) ^
-			(bool "P" x.Xc.paused) ^ (bool "B" x.Xc.blocked) ^
-			(bool "R" x.Xc.running) ^ (bool "H" x.Xc.hvm_guest) in
-		let shutdown_code     = int x.Xc.shutdown_code in
-		let tot_memory_mib    = page_to_mib x.Xc.total_memory_pages in
-		let max_memory_mib    = page_to_mib x.Xc.max_memory_pages in
-		let shared_info_frame = int64 x.Xc.shared_info_frame in
-		let cpu_time          = int64 x.Xc.cpu_time in
-		let nr_online_vcpus   = int x.Xc.nr_online_vcpus in
-		let max_vcpu_id       = int x.Xc.max_vcpu_id in
-		let ssidref           = int32 x.Xc.ssidref in
-		let handle            = Uuid.to_string (Uuid.uuid_of_int_array x.Xc.handle) in
+			(bool "D" x.Xenctrl.dying) ^ (bool "S" x.Xenctrl.shutdown) ^
+			(bool "P" x.Xenctrl.paused) ^ (bool "B" x.Xenctrl.blocked) ^
+			(bool "R" x.Xenctrl.running) ^ (bool "H" x.Xenctrl.hvm_guest) in
+		let shutdown_code     = int x.Xenctrl.shutdown_code in
+		let tot_memory_mib    = page_to_mib x.Xenctrl.total_memory_pages in
+		let max_memory_mib    = page_to_mib x.Xenctrl.max_memory_pages in
+		let shared_info_frame = int64 x.Xenctrl.shared_info_frame in
+		let cpu_time          = int64 x.Xenctrl.cpu_time in
+		let nr_online_vcpus   = int x.Xenctrl.nr_online_vcpus in
+		let max_vcpu_id       = int x.Xenctrl.max_vcpu_id in
+		let ssidref           = int32 x.Xenctrl.ssidref in
+		let handle            = Uuid.to_string (Uuid.uuid_of_int_array x.Xenctrl.handle) in
 
 		if verbose then
 			[ domid; state; shutdown_code; tot_memory_mib; max_memory_mib;
@@ -186,45 +175,86 @@ let list_domains ~xc ~verbose =
 			[ domid; state; cpu_time; handle ]
 		in
 
-	let print (rows: string list list) =
-		let widths = Table.compute_col_widths rows in
-		let sll = List.map (List.map2 Table.right widths) rows in
-		List.iter (fun line -> print_endline (String.concat " | " line)) sll
-		in
-
-	let l = Xc.domain_getinfolist xc 0 in
+	let l = Xenctrl.domain_getinfolist xc 0 in
 	let header = header () in
 	let infos = List.map sl_of_domaininfo l in
-	print (header :: infos)
+	print_table (header :: infos)
 
-let list_devices ~xs ~domid = 
-	(* Assume all drivers are in domain 0 *)
-	let all = list_devices_between ~xs 0 domid in
-	let string_of_state path = 
-	  try
-	    Xenbus.to_string_desc (Xenbus.of_string (xs.Xs.read (sprintf "%s/state" path)))
-	  with _ -> "gone" in
-	List.iter (fun device ->
-		     let fe = frontend_path_of_device ~xs device
-		     and be = backend_path_of_device ~xs device in
-		     let bdev = try xs.Xs.read (sprintf "%s/dev" be) with _ -> "" in
-		     printf "%s[%d] is %s to dom(%d) ty(%s) devid(%d %s) state(%s)\n"
-		       (string_of_kind device.frontend.kind) 
-		       device.frontend.devid 
-		       (string_of_state fe)
-		       device.backend.domid
-		       (string_of_kind device.backend.kind)
-		       device.backend.devid
-		       bdev 
-		       (string_of_state be)
-		  ) all
+(*
+   backend                  frontend
+   ---------------------------------------------------------------
+   domain domstate ty devid state -> domain domstate ty devid state
 
-let add_vbd ~xs ~hvm ~domid ~device_number ~phystype ~physpath ~dev_type ~mode ~backend_domid =
-	let phystype = Device.Vbd.physty_of_string phystype in
-	let dev_type = Device.Vbd.devty_of_string dev_type in
+   where domstate = R | S | D | ?
+   state = 1 | 2 | 3 | 4 | 5 | 6 | ?          
+*)
 
-	Device.Vbd.add ~xs ~hvm ~mode:(Device.Vbd.mode_of_string mode)
-	               ~phystype ~physpath ~device_number ~dev_type ~backend_domid domid
+type device_stat = {
+	device: device;
+	backend_proto: string;   (* blk or net *)
+	backend_device: string;  (* physical device eg. fd:2 *)
+	backend_state: string;   (* 1...6 *)
+	frontend_type: string;   (* cdrom or hd *)
+	frontend_device: string; (* linux device name *)
+	frontend_state: string;  (* 1..6 *)
+}
+let device_state_to_sl ds =
+	let int = string_of_int in
+	[ int ds.device.backend.domid; ds.backend_proto; ds.backend_device; ds.backend_state; "->"; ds.frontend_state; ds.frontend_type; ds.frontend_device; int ds.device.frontend.domid; ]
+
+let stat ~xs d =
+	let frontend_state = try xs.Xs.read (sprintf "%s/state" (frontend_path_of_device ~xs d)) with Xenbus.Xb.Noent -> "??" in
+	let backend_state = try xs.Xs.read (sprintf "%s/state" (backend_path_of_device ~xs d)) with Xenbus.Xb.Noent -> "??" in
+	(* The params string can be very long, truncate to a more reasonable width *)
+	let truncate params =
+		let limit = 10 in
+		let dots = "..." in
+		let len = String.length params in
+		if len <= limit
+		then params
+		else
+			let take = limit - (String.length dots) in
+			dots ^ (String.sub params (len - take) take) in
+	let backend_proto = match d.backend.kind with
+		| Vbd | Tap -> "blk"
+		| Vif -> "net"
+		| x -> string_of_kind x in
+	let frontend_type = match d.frontend.kind with
+		| Vbd | Tap ->
+			let be = frontend_path_of_device ~xs d in
+			(try if xs.Xs.read (sprintf "%s/device-type" be) = "cdrom" then "cdrom" else "disk" with _ -> "??")
+		| x -> string_of_kind x in
+	let backend_device = match d.backend.kind with
+		| Vbd | Tap ->
+			let be = backend_path_of_device ~xs d in
+			(try xs.Xs.read (sprintf "%s/physical-device" be)
+			with Xenbus.Xb.Noent ->
+				(try truncate (xs.Xs.read (sprintf "%s/params" be))
+				with Xenbus.Xb.Noent -> "??"))
+		| Vif -> "-"
+		| _ -> string_of_int d.backend.devid in
+	let frontend_device = match d.frontend.kind with
+		| Vbd | Tap -> Device_number.to_linux_device (Device_number.of_xenstore_key d.frontend.devid)
+		| _ -> string_of_int d.frontend.devid in
+	{ device = d; frontend_state = frontend_state; backend_state = backend_state; frontend_device = frontend_device; frontend_type = frontend_type; backend_proto = backend_proto; backend_device = backend_device }
+
+let list_devices ~xc ~xs =
+	let header = [ "be"; "proto"; "dev"; "state"; "->"; "state"; "kind"; "dev"; "fe" ] in
+	let of_device (d: device) : string list =
+		device_state_to_sl (stat ~xs d) in
+	let l = Xenctrl.domain_getinfolist xc 0 in
+	let domids = List.map (fun x -> x.Xenctrl.domid) l in
+	let devices =
+		Listext.List.setify (
+			List.concat (
+				List.map
+					(fun domid ->
+						list_backends ~xs domid @ (list_frontends ~xs domid)
+				) domids
+			)
+		) in
+	let infos = List.map of_device devices in
+	print_table (header :: infos)
 
 let find_device ~xs (frontend: endpoint) (backend: endpoint) = 
   let all = list_devices_between ~xs backend.domid frontend.domid in
@@ -284,13 +314,15 @@ let list_pci ~xc ~xs ~domid =
 		  ) pcidevs
 
 let add_dm ~xs ~domid ~static_max_kib ~vcpus ~boot =
-	let dmpath = Xapi_globs.base_path ^ "/libexec/qemu-dm-wrapper" in
+    let dmpath = Filename.concat Fhs.libexecdir "qemu-dm-wrapper" in
 	let info = {
  	  Device.Dm.memory = static_max_kib;
  	  Device.Dm.boot = boot;
- 	  Device.Dm.serial = "pty";
+ 	  Device.Dm.serial = Some "pty";
+	  Device.Dm.monitor = Some "pty";
  	  Device.Dm.vcpus = vcpus;
  	  Device.Dm.nics = [];
+	  Device.Dm.disks = [];
  	  Device.Dm.pci_emulations = [];
 	  Device.Dm.pci_passthrough = false;
  	  Device.Dm.usb = [];
@@ -303,7 +335,7 @@ let add_dm ~xs ~domid ~static_max_kib ~vcpus ~boot =
 	  Device.Dm.power_mgmt=None;
 	  Device.Dm.oem_features=None;
 	  Device.Dm.inject_sci=None;
-	  Device.Dm.videoram=0;
+	  Device.Dm.video_mib=0;
 
  	  Device.Dm.extras = []
  	} in
@@ -328,27 +360,27 @@ let del_irq ~xc ~domid ~irq =
 	Domain.del_irq ~xc domid irq
 
 let sched_domain ~xc ~domid ~weight ~cap =
-	if Xc.sched_id xc <> 5 then
+	if Xenctrl.sched_id xc <> 5 then
 		failwith "not using credit scheduler";
 	match weight, cap with
 	| Some wei, Some cap ->
-		Xc.sched_credit_domain_set xc domid
-		                           { Xc.weight = wei; Xc.cap = cap }
+		Xenctrl.sched_credit_domain_set xc domid
+		                           { Xenctrl.weight = wei; Xenctrl.cap = cap }
 	| None, Some cap     ->
-		let old = Xc.sched_credit_domain_get xc domid in
-		Xc.sched_credit_domain_set xc domid
-		               { old with Xc.cap = cap }
+		let old = Xenctrl.sched_credit_domain_get xc domid in
+		Xenctrl.sched_credit_domain_set xc domid
+		               { old with Xenctrl.cap = cap }
 	| Some wei, None     ->
-		let old = Xc.sched_credit_domain_get xc domid in
-		Xc.sched_credit_domain_set xc domid
-		               { old with Xc.weight = wei }
+		let old = Xenctrl.sched_credit_domain_get xc domid in
+		Xenctrl.sched_credit_domain_set xc domid
+		               { old with Xenctrl.weight = wei }
 	| None, None         -> ()
 
 let sched_domain_get ~xc ~domid =
-	if Xc.sched_id xc <> 5 then
+	if Xenctrl.sched_id xc <> 5 then
 		failwith "not using credit scheduler";
-	let params = Xc.sched_credit_domain_get xc domid in
-	params.Xc.weight, params.Xc.cap
+	let params = Xenctrl.sched_credit_domain_get xc domid in
+	params.Xenctrl.weight, params.Xenctrl.cap
 
 
 let affinity_set ~xc ~domid ~vcpu ~bitmap =
@@ -365,14 +397,6 @@ let affinity_get ~xc ~domid ~vcpu =
 	let s = String.make (Array.length cpumap) '0' in
 	Array.iteri (fun i b -> s.[i] <- if b then '1' else '0') cpumap;
 	printf "%s\n" s
-
-let self_test () =
-	let device_tests = [ "sda2"; "sda"; "xvdd"; "xvda1"; "hde4"; "hdf" ] in
-	let numbers = List.map Device.Vbd.device_major_minor device_tests in
-	let names = List.map Device.Vbd.major_minor_to_device numbers in
-	List.iter (fun (a, ((major, minor), b)) ->
-		     if a <> b then failwith (Printf.sprintf "%s -> (%d, %d) -> %s" a major minor b))
-	  (List.combine device_tests (List.combine numbers names))
 
 let cmd_alias cmd =
 	match cmd with
@@ -393,23 +417,24 @@ let cmd_alias cmd =
 	| "getuuid_domain"          -> "dom-uuid"
 	| _                         -> cmd
 
-let usage subcmd allcommands =
-	let usage_all () =
-		let l = List.map (fun (cmd, _) -> "\t" ^ cmd) allcommands in
-		sprintf "%s\n" (String.concat "\n" ("usage:" :: l)) in
-	(* Unfortunately we can not reuse Arg.usage since it always output to stdout *)
-	let usage_sub c =
-		let spec = List.assoc c allcommands in
-		let l = List.map (fun (opt, _, doc) -> sprintf "  %s %s" opt doc) spec in
-		sprintf "%s\n" (String.concat "\n" (c :: l)) in
-	match subcmd with
-	| None -> Arg.Help (usage_all ())
-	| Some c ->
-		try Arg.Help (usage_sub c)
-		with Not_found ->
-			Arg.Bad (sprintf "Unknown subcommand: %s\n%s" c (usage_all ()))
 
-let do_cmd_parsing subcmd init_pos=
+let usage subcmd allcommands =
+    let usage_all () =
+        let l = List.map (fun (cmd, _) -> "\t" ^ cmd) allcommands in
+        sprintf "%s\n" (String.concat "\n" ("usage:" :: l)) in
+    (* Unfortunately we can not reuse Arg.usage since it always output to stdout *)
+    let usage_sub c =
+        let spec = List.assoc c allcommands in
+        let l = List.map (fun (opt, _, doc) -> sprintf "  %s %s" opt doc) spec in
+        sprintf "%s\n" (String.concat "\n" (c :: l)) in
+    match subcmd with
+		| None -> Arg.Help (usage_all ())
+		| Some c ->
+            try Arg.Help (usage_sub c)
+            with Not_found ->
+                Arg.Bad (sprintf "Unknown subcommand: %s\n%s" c (usage_all ()))
+
+let do_cmd_parsing subcmd init_pos =
 	let domid = ref (-1)
 	and backend_domid = ref (0)
 	and hvm = ref false
@@ -429,8 +454,8 @@ let do_cmd_parsing subcmd init_pos=
 	and file = ref ""
 	and mode = ref ""
 	and phystype = ref ""
-	and physpath = ref ""
-	and device_number = ref (Device_number.make (Device_number.Xen(0, 0)))
+	and params = ref ""
+	and device_number = ref None
 	and dev_type = ref "disk"
 	and devid = ref 0
 	and reason = ref None
@@ -457,17 +482,17 @@ let do_cmd_parsing subcmd init_pos=
 	let set_int64 r s =
 		try r := Int64.of_string s
 		with _ -> eprintf "cannot parse %s at integer\n" s
-	in
-
+		in
 	let set_netty s =
 		match String.split ':' s with
 		| "DriverDomain" :: []    -> netty := Netman.DriverDomain
 		| "bridge" :: bname :: [] -> netty := Netman.Bridge bname
 		| _                       -> eprintf "not a valid network type: %s\n" s
-	in
+		in
 
 	let common = [
-		"-debug", Arg.Unit (fun () -> Logs.set_default Log.Debug [ "stderr" ]), "enable debugging";
+		"-debug", Arg.Unit (fun () -> Logs.set_default Log.Debug [ "stderr" ]),
+			  "enable debugging";
 		"-domid", Arg.Set_int domid, "Domain ID to be built";
 	]
 	and setmaxmem_args = [
@@ -497,8 +522,8 @@ let do_cmd_parsing subcmd init_pos=
 	and vbd_args = [
 		"-mode", Arg.Set_string mode, "Vbd Mode";
 		"-phystype", Arg.Set_string phystype, "Vbd set physical type (file|phy)";
-		"-physpath", Arg.Set_string physpath, "Vbd set physical path";
-		"-device-number", Arg.String (fun x -> device_number := (Device_number.of_string false x)), "Vbd set device_number";
+        "-params", Arg.Set_string params, "Vbd set params (i.e. block device)";
+        "-virtual-device", Arg.String (fun x -> device_number := Some (Device_number.of_string false x)), "Expose as this virtual device in the guest (default autodetect)";
 		"-devtype", Arg.Set_string dev_type, "Vbd dev type";
 	]
 	and vif_args = [
@@ -576,7 +601,7 @@ let do_cmd_parsing subcmd init_pos=
 		("affinity_set"   , common @ affinity_args @ affinity_set_args);
 		("affinity_get"   , common @ affinity_args);
 		("list_domains"   , list_args);
-		("list_devices"   , common);
+		("list_devices"   , []);
 		("add_vbd"        , common @ vbd_args @ backend_args);
 		("del_vbd"        , common @ vbd_args @ backend_args);
 		("add_vif"        , common @ vif_args @ backend_args);
@@ -608,46 +633,44 @@ let do_cmd_parsing subcmd init_pos=
 		("pcpuinfo"       , []);
 		("help"           , []);
 	] in
-
-	let () =
-		let () =
-			match usage (Some subcmd) allcommands with
-			| Arg.Help _ -> () | e -> raise e in
-		let spec = List.assoc subcmd allcommands in
-		Arg.current := init_pos;
-		Arg.parse_argv Sys.argv spec
-			(fun x ->
-				if x.[0] = '-' then
-					eprintf "Warning, ignoring unknown argument: %s\n" x
-				else
-					otherargs := x :: !otherargs
-			) subcmd in
-	!domid, !backend_domid, !hvm, !vcpus, !vcpu, !kernel,
-	!ramdisk, !cmdline, Int64.of_int !mem_max_kib, Int64.of_int !mem_mib,
-	!pae, !apic, !acpi, !nx, !viridian, !verbose, !file,
-	!mode, !phystype, !physpath, !device_number, !dev_type, !devid, !mac, !pci,
-	!reason, !sysrq, !script, !sync, !netty, !weight, !cap, !bitmap, !cooperative,
-	!boot, !ioport_start, !ioport_end, !iomem_start, !iomem_end, !irq,
-	!slot, !timeout, List.rev !otherargs, allcommands
+       let () =
+               let () =
+                       match usage (Some subcmd) allcommands with
+                       | Arg.Help _ -> () | e -> raise e in
+               let spec = List.assoc subcmd allcommands in
+               Arg.current := init_pos;
+               Arg.parse_argv Sys.argv spec
+                       (fun x ->
+                               if x.[0] = '-' then
+                                       eprintf "Warning, ignoring unknown argument: %s\n" x
+                               else
+                                       otherargs := x :: !otherargs
+                       ) subcmd in
+		!domid, !backend_domid, !hvm, !vcpus, !vcpu, !kernel,
+		!ramdisk, !cmdline, Int64.of_int !mem_max_kib, Int64.of_int !mem_mib,
+		!pae, !apic, !acpi, !nx, !viridian, !verbose, !file,
+		!mode, !phystype, !params, !device_number, !dev_type, !devid, !mac, !pci,
+		!reason, !sysrq, !script, !sync, !netty, !weight, !cap, !bitmap, !cooperative,
+		!boot, !ioport_start, !ioport_end, !iomem_start, !iomem_end, !irq,
+		!slot, !timeout, List.rev !otherargs, allcommands
 
 let _ = try
 
-	let subcmd, init_pos =
-		let cmd = Filename.basename Sys.argv.(0) in
-		if cmd <> "xenops" then cmd, 0
-		else if Array.length Sys.argv > 1 then Sys.argv.(1), 1
-		else "help", 0 in
+    let subcmd, init_pos =
+        let cmd = Filename.basename Sys.argv.(0) in
+        if cmd <> "xenops" then cmd, 0
+        else if Array.length Sys.argv > 1 then Sys.argv.(1), 1
+        else "help", 0 in
 
-	let subcmd = cmd_alias subcmd in
-
+    let subcmd = cmd_alias subcmd in
 	let domid, backend_domid, hvm, vcpus, vcpu, kernel, ramdisk, cmdline,
-		max_kib, mem_mib, pae, apic, acpi, nx, viridian, verbose, file, mode,
-		phystype, physpath, device_number, dev_type, devid, mac, pci, reason, sysrq,
-		script, sync, netty, weight, cap, bitmap, cooperative,
-		boot, ioport_start, ioport_end, iomem_start, iomem_end, irq,
-		slot, timeout, otherargs, allcommands = do_cmd_parsing subcmd init_pos in
+               max_kib, mem_mib, pae, apic, acpi, nx, viridian, verbose, file, mode,
+               phystype, params, device_number, dev_type, devid, mac, pci, reason, sysrq,
+               script, sync, netty, weight, cap, bitmap, cooperative,
+               boot, ioport_start, ioport_end, iomem_start, iomem_end, irq,
+               slot, timeout, otherargs, allcommands = do_cmd_parsing subcmd init_pos in
 
-	let is_domain_hvm xc domid = (Xc.domain_getinfo xc domid).Xc.hvm_guest in
+	let is_domain_hvm xc domid = (Xenctrl.domain_getinfo xc domid).Xenctrl.hvm_guest in
 
 	(* Aliases *)
 	let target_kib = max_kib in
@@ -676,7 +699,7 @@ let _ = try
 		with_xc_and_xs (fun xc xs -> build_hvm ~xc ~xs ~kernel ~vcpus ~static_max_kib ~target_kib ~domid)
 	| "setmaxmem"     ->
 		assert_domid ();
-		with_xc (fun xc -> Xc.domain_setmaxmem xc domid max_kib) (* call takes pages *)
+		with_xc (fun xc -> Xenctrl.domain_setmaxmem xc domid max_kib) (* call takes pages *)
 	| "save_domain"   ->
 		assert_domid (); assert_file ();
 		with_xc_and_xs (fun xc xs -> suspend_domain_and_destroy ~xc ~xs ~domid ~file)
@@ -691,7 +714,7 @@ let _ = try
 		match reason with
 		| None -> error "no shutdown reason specified"
 		| Some reason ->
-			with_xal (fun xal -> clean_shutdown_domain ~xal ~domid ~reason ~sync)
+			failwith "use 'xn' instead"
 		)
 	| "hard_shutdown_domain" -> (
 		assert_domid ();
@@ -712,8 +735,7 @@ let _ = try
 	| "list_domains" ->
 		with_xc (fun xc -> list_domains ~xc ~verbose)
 	| "list_devices" ->
-		assert_domid ();
-		with_xs (fun xs -> list_devices ~xs ~domid)
+		with_xc_and_xs (fun xc xs -> list_devices ~xc ~xs)
 	| "sched_domain" ->
 		assert_domid ();
 		with_xc (fun xc -> sched_domain ~xc ~domid ~weight ~cap)
@@ -734,10 +756,24 @@ let _ = try
 		assert_domid ();
 		with_xc_and_xs (fun xc xs ->
 			let hvm = is_domain_hvm xc domid in
-			ignore(add_vbd ~xs ~hvm ~domid ~device_number ~phystype ~physpath ~dev_type ~unpluggable:false ~mode ~backend_domid)
+			let vbd = {
+				Device.Vbd.mode = Device.Vbd.mode_of_string mode;
+                device_number = device_number;
+                phystype = Device.Vbd.physty_of_string phystype;
+                params = params;
+                dev_type = Device.Vbd.devty_of_string dev_type;
+                unpluggable = true;
+                protocol = None;
+                extra_backend_keys = [];
+                extra_private_keys = [];
+                backend_domid = backend_domid
+            } in
+            let (_: device) = Device.Vbd.add ~xs ~hvm vbd domid in
+            ()
 		)
 	| "del_vbd" ->
 		assert_domid ();
+        let device_number = Opt.unbox device_number in
 		with_xs (fun xs -> del_vbd ~xs ~domid ~backend_domid ~device_number ~phystype)
 	| "add_vif" ->
 		assert_domid ();
@@ -799,7 +835,7 @@ let _ = try
 	| "watchdog" ->
 		if slot < 0 then error "slot";
 		if timeout = -1l then error "timeout";
-		Printf.printf "%d\n" (with_xc (fun xc -> Xc.watchdog xc slot timeout))
+		Printf.printf "%d\n" (with_xc (fun xc -> Xenctrl.watchdog xc slot timeout))
 	| "send-s3resume" ->
 		assert_domid ();
 		with_xc (fun xc -> Domain.send_s3resume ~xc domid);
@@ -818,14 +854,11 @@ let _ = try
 	| "pcpuinfo" ->
 		with_xc (fun xc -> print_pcpus_info ~xc);
 	| "capabilities" ->
-		with_xc (fun xc -> print_endline (Xc.version_capabilities xc))
-	| "test" ->
-		self_test ()
-	| "help" ->
-		raise (usage (try Some (List.hd otherargs) with _ -> None) allcommands)
-	| s ->
-		raise (usage (Some s) allcommands)
+		with_xc (fun xc -> print_endline (Xenctrl.version_capabilities xc))
+    | "help" ->
+        raise (usage (try Some (List.hd otherargs) with _ -> None) allcommands)
+    | s ->
+        raise (usage (Some s) allcommands)
 with
 | Arg.Help msg -> printf "%s\n" msg; exit 0
 | Arg.Bad msg -> eprintf "%s\n" msg; exit 1
-

@@ -15,7 +15,7 @@
 module D=Debug.Debugger(struct let name="xapi" end)
 open D
 
-open Xmlrpcclient
+open Xmlrpc_client
 open Xapi_network_types
 open Forkhelpers
 open Threadext
@@ -84,7 +84,11 @@ let http_proxy master_ip ip =
 				(* Make sure we don't try to double-close the server *)
 				server := None;
 				let handler = { Server_io.name = "http_proxy"; body = tcp_connection } in
-				let sock = Xapi_http.bind sockaddr in
+				let sock = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+				Unix.bind sock sockaddr;
+				Unix.setsockopt sock Unix.SO_REUSEADDR true;
+				Unixext.set_tcp_nodelay sock true;
+				Unix.listen sock 5;
 				let s = Server_io.server handler sock in
 				server := Some s
 			)
@@ -94,7 +98,7 @@ let http_proxy master_ip ip =
 			
 let maybe_start bridge other_config =
 	if not(List.mem_assoc "ip_begin" other_config)
-	then error "Cannot setup host internal management network: no other-config:i_begin"
+	then error "Cannot setup host internal management network: no other-config:ip_begin"
 	else begin
 		let ip = List.assoc "ip_begin" other_config in
 		let address = Helpers.get_main_ip_address () in

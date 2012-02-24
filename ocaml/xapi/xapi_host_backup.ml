@@ -23,8 +23,8 @@ open Helpers
 module D = Debug.Debugger(struct let name="xapi" end)
 open D
 
-let host_backup = Xapi_globs.base_path ^ "/libexec/host-backup"
-let host_restore = Xapi_globs.base_path ^ "/libexec/host-restore"
+let host_backup = Filename.concat Fhs.libexecdir "host-backup"
+let host_restore = Filename.concat Fhs.libexecdir "host-restore"
 
 let host_backup_handler_core ~__context s =
 	match
@@ -58,7 +58,7 @@ let host_backup_handler_core ~__context s =
 			debug "host_backup failed - host_backup returned: %s" log;
 			raise (Api_errors.Server_error (Api_errors.backup_script_failed, [log]))
 
-let host_backup_handler (req: Request.t) s =
+let host_backup_handler (req: Request.t) s _ =
 	req.Request.close <- true;
 	Xapi_http.with_context "Downloading host backup" req s
 		(fun __context ->
@@ -74,7 +74,7 @@ let close to_close fd =
 	if List.mem fd !to_close then Unix.close fd;
 	to_close := List.filter (fun x -> fd <> x) !to_close
 
-let host_restore_handler (req: Request.t) s =
+let host_restore_handler (req: Request.t) s _ =
 	req.Request.close <- true;
 	Xapi_http.with_context "Uploading host backup" req s
 		(fun __context ->

@@ -60,7 +60,8 @@ let valid_operations ~expensive_sharing_checks ~__context record _ref' : table =
 		 then Hashtbl.replace table op (Some(code, params))) ops in
 
   let vm = Db.VBD.get_VM ~__context ~self:_ref' in
-  let is_control_domain = Db.VM.get_is_control_domain ~__context ~self:vm in
+  let vm_r = Db.VM.get_record ~__context ~self:vm in
+  let is_system_domain = System_domains.is_system_domain vm_r in
 
   let safe_to_parallelise = [ `pause; `unpause ] in
 
@@ -152,24 +153,27 @@ let valid_operations ~expensive_sharing_checks ~__context record _ref' : table =
 		let vbd_records = 
 			let vbds = List.filter (fun vbd -> vbd <> _ref') vdi_record.Db_actions.vDI_VBDs in
 			List.concat (List.map (fun self -> try [ Db.VBD.get_record_internal ~__context ~self ] with _ -> []) vbds) in	
-	(* Any VBD with a current_operation is said to conflict
-	   EXCEPT if I'm a control_domain (running pygrub) and the VBD is being 'attach'ed for booting *)
-	let any p xs = try ignore(List.find p xs); true with Not_found -> false in
-	let conflicting (_, op) = not (is_control_domain && op = `attach) in
 	let pointing_to_a_suspended_VM vbd =
 		Db.VM.get_power_state ~__context ~self:(vbd.Db_actions.vBD_VM) = `Suspended in
+	let pointing_to_a_system_domain vbd =
+		System_domains.get_is_system_domain ~__context ~self:(vbd.Db_actions.vBD_VM) in
 
 	let vbds_to_check = List.filter 
-	  (fun self -> not (pointing_to_a_suspended_VM self) && (
-	     self.Db_actions.vBD_currently_attached || 
-	       self.Db_actions.vBD_reserved || (* happens during reboots *)
-	       (any conflicting self.Db_actions.vBD_current_operations))) vbd_records in
+	  (fun self ->
+		  not (pointing_to_a_suspended_VM self) (* these are really offline *)
+		  && not (pointing_to_a_system_domain self) (* these can share the disk safely *)
+		  && (
+			  self.Db_actions.vBD_currently_attached
+			  || self.Db_actions.vBD_reserved
+			  || self.Db_actions.vBD_current_operations <> []
+		  )
+	  ) vbd_records in
 	let someones_got_rw_access = 
 	  try let (_: Db_actions.vBD_t) = List.find (fun vbd -> vbd.Db_actions.vBD_mode = `RW) vbds_to_check in true with _ -> false
 	in
 	let need_write = record.Db_actions.vBD_mode = `RW in
 	(* Read-only access doesn't require VDI to be marked sharable *)
-	if not(vdi_record.Db_actions.vDI_sharable) && someones_got_rw_access
+	if not(vdi_record.Db_actions.vDI_sharable) && (not is_system_domain) && someones_got_rw_access
 	then set_errors Api_errors.vdi_in_use [ Ref.string_of vdi ] [ `attach; `insert; `plug ];
 	if need_write && vdi_record.Db_actions.vDI_read_only 
 	then set_errors Api_errors.vdi_readonly [ Ref.string_of vdi ] [ `attach; `insert; `plug ]
@@ -252,82 +256,6 @@ let valid_device dev =
 	| 'x' :: 'v' :: 'd' :: ('a'..'p') :: rest -> check_rest rest
 	| 'h' :: 'd' :: ('a'..'p') :: rest -> check_rest rest
 	| _ -> try let n = int_of_string dev in n >= 0 || n <16 with _ -> false
-
-(** Hold this mutex while resolving the 'autodetect' device names to prevent two concurrent
-    VBD.creates racing with each other and choosing the same device. For simplicity keep this
-    as a global lock rather than a per-VM one. Rely on the fact that the message forwarding layer
-    always runs this code on the master. *)
-let autodetect_mutex = Mutex.create ()
-
-(** VBD.create doesn't require any interaction with xen *)
-let create  ~__context ~vM ~vDI ~userdevice ~bootable ~mode ~_type ~unpluggable ~empty
-           ~qos_algorithm_type ~qos_algorithm_params ~other_config : API.ref_VBD =
-
-	if not empty then begin
-	  let vdi_type = Db.VDI.get_type ~__context ~self:vDI in
-	  if not(List.mem vdi_type [ `system; `user; `ephemeral; `suspend; `crashdump; `metadata])
-	  then raise (Api_errors.Server_error(Api_errors.vdi_incompatible_type, [ Ref.string_of vDI; Record_util.vdi_type_to_string vdi_type ]))
-	end;
-	
-	(* All "CD" VBDs must be readonly *)
-	if _type = `CD && mode <> `RO
-	then raise (Api_errors.Server_error(Api_errors.vbd_cds_must_be_readonly, []));
-	(* Only "CD" VBDs may be empty *)
-	if _type <> `CD && empty
-	then raise (Api_errors.Server_error(Api_errors.vbd_not_removable_media, [ "in constructor" ]));
-
-	(* Prevent VBDs being created which are of type "CD" which are
-	   not either .iso files or CD block devices *)
- 	if _type = `CD && not(empty) 
-	then Xapi_vdi_helpers.assert_vdi_is_valid_iso ~__context ~vdi:vDI;
-	(* Prevent RW VBDs being created pointing to RO VDIs *)
-	if mode = `RW && Db.VDI.get_read_only ~__context ~self:vDI
-	then raise (Api_errors.Server_error(Api_errors.vdi_readonly, [ Ref.string_of vDI ]));
-
-	Mutex.execute autodetect_mutex
-	  (fun () ->
-	     let possibilities = Xapi_vm_helpers.allowed_VBD_devices ~__context ~vm:vM in
-
-             if not (valid_device userdevice) || (userdevice = "autodetect" && possibilities = []) then 
-               raise (Api_errors.Server_error (Api_errors.invalid_device,[userdevice]));
-	     
-	     (* Resolve the "autodetect" into a fixed device name now *)
-	     let userdevice = if userdevice = "autodetect" 
-	     then string_of_int (Device_number.to_disk_number (List.hd possibilities)) (* already checked for [] above *)
-	     else userdevice in
-	     
-	     let uuid = Uuid.make_uuid () in
-	     let ref = Ref.make () in
-	     debug "VBD.create (device = %s; uuid = %s; ref = %s)" 
-	       userdevice (Uuid.string_of_uuid uuid) (Ref.string_of ref);
-	     
-	     (* Check that the device is definitely unique. If the requested device is numerical
-		    (eg 1) then we 'expand' it into other possible names (eg 'hdb' 'xvdb') to detect
-		    all possible clashes. *)
-		 let userdevices = Xapi_vm_helpers.possible_VBD_devices_of_string userdevice in
-		 let existing_devices = Xapi_vm_helpers.all_used_VBD_devices ~__context ~self:vM in
-		 if Listext.List.intersect userdevices existing_devices <> []
-	     then raise (Api_errors.Server_error (Api_errors.device_already_exists, [userdevice]));
-
-	     (* Make people aware that non-shared disks make VMs not agile *)
-	     if not empty then assert_doesnt_make_vm_non_agile ~__context ~vm:vM ~vdi:vDI;
-	     
-	     let metrics = Ref.make () and metrics_uuid = Uuid.to_string (Uuid.make_uuid ()) in
-	     Db.VBD_metrics.create ~__context ~ref:metrics ~uuid:metrics_uuid
-	       ~io_read_kbs:0. ~io_write_kbs:0. ~last_updated:(Date.of_float 0.)
-	       ~other_config:[];
-	     
-	     Db.VBD.create ~__context ~ref ~uuid:(Uuid.to_string uuid)
-	       ~current_operations:[] ~allowed_operations:[] ~storage_lock:false
-	       ~vM ~vDI ~userdevice ~device:"" ~bootable ~mode ~_type ~unpluggable ~empty ~reserved:false
-	       ~qos_algorithm_type ~qos_algorithm_params ~qos_supported_algorithms:[]
-	       ~currently_attached:false
-	       ~status_code:Int64.zero ~status_detail:""
-               ~runtime_properties:[] ~other_config
-	       ~metrics;
-	     update_allowed_operations ~__context ~self:ref;
-	     ref
-	  ) 
 
 (** VBD.destroy doesn't require any interaction with xen *)
 let destroy  ~__context ~self =

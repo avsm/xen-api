@@ -78,6 +78,9 @@ body {
 	color: white;
 }
 
+#sidebar #class_overview a {
+	font-weight: bold;
+}
 
 #sidebar th {
 	text-align: left;
@@ -236,6 +239,7 @@ tt, .code {
 	margin: 0em 0;
 	padding: .5em .7em .7em;
 	background-color: #ffeeaa;
+	cursor: pointer;
 }
 
 .field2
